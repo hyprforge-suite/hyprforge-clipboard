@@ -218,11 +218,55 @@ impl Inner {
             }
         }
 
-        match self.connection.flush() {
-            Ok(()) => true,
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to flush a synthesized paste; the clipboard is still set");
+        if let Err(e) = self.connection.flush() {
+            tracing::warn!(error = %e, "failed to flush a synthesized paste; the clipboard is still set");
+            return false;
+        }
+
+        // Flushing is not enough, and this cost an afternoon to find.
+        // `flush` puts the key events on the socket; it does not wait
+        // for the compositor to read them. A popup that synthesises a
+        // paste and exits immediately destroys its virtual keyboard
+        // while those events are still unread, and the keystroke is
+        // never delivered — measured directly against a focused window
+        // that captures raw bytes: exiting straight after the flush
+        // delivered nothing at all, and the identical call followed by a
+        // wait delivered `^V`.
+        //
+        // A round trip is what makes it deterministic rather than a
+        // sleep tuned until it stopped failing: the compositor cannot
+        // answer a sync until it has processed everything queued before
+        // it, so a reply *is* the proof the keys were taken.
+        //
+        // This bug hid behind a coincidence. The caller used to wait on
+        // the clipboard source's guard immediately afterwards, which
+        // kept the process alive long enough by accident — so handing
+        // the selection to `hyprforge-clipd` (which leaves no local
+        // guard to wait on) is what exposed it. Pasting got worse
+        // because the clipboard got better.
+        let bounded = std::sync::mpsc::channel();
+        let connection = self.connection.clone();
+        // Its own thread because `roundtrip` has no timeout of its own,
+        // and CLAUDE.md is explicit that nothing waits on another
+        // process without a bound — a wedged compositor must not hang a
+        // popup that has already done the useful part of its job.
+        std::thread::spawn(move || {
+            let _ = bounded.0.send(connection.roundtrip());
+        });
+        match bounded.1.recv_timeout(ROUNDTRIP_TIMEOUT) {
+            Ok(Ok(_)) => true,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "the compositor closed the connection while taking a synthesized paste");
                 false
+            }
+            Err(_) => {
+                tracing::warn!("the compositor did not acknowledge a synthesized paste in time");
+                // Reported as sent regardless: the events were flushed,
+                // and a compositor too busy to answer a sync may well
+                // still deliver them. Saying "unavailable" here would
+                // tell the user to press Ctrl+V themselves for a paste
+                // that is probably about to happen anyway.
+                true
             }
         }
     }
@@ -254,6 +298,14 @@ impl WaylandPaster {
         }
     }
 }
+
+/// How long to wait for the compositor to acknowledge the synthesised
+/// keys before giving up on the acknowledgement (not on the keys).
+///
+/// Generous: this only has to cover a compositor answering a sync, which
+/// is microseconds when it is healthy, and the cost of being wrong in
+/// the tight direction is a paste that silently does not happen.
+const ROUNDTRIP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 impl crate::paste::PasteSynthesizer for WaylandPaster {
     fn paste(&self, shortcut: Shortcut) -> PasteOutcome {
