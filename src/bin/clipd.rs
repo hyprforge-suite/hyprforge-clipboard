@@ -1,19 +1,43 @@
 //! `hyprforge-clipd`: watches the compositor's clipboard and records what
 //! is worth keeping.
 //!
-//! # This daemon owns every write to the history file
+//! # This daemon is still the only writer — now other processes can ask
 //!
-//! There is deliberately no IPC in this crate — no socket, no D-Bus
-//! name, nothing a popup could ask this daemon to do. The popup (a
-//! separate crate) only ever *reads* [`hyprforge_paths::clipboard_index_path`]
-//! and its images directory; this daemon is the only process that ever
-//! calls [`History::save`]. Two writers racing to save the same index
-//! file — the daemon recording a new copy while a popup saves a pin
-//! toggle — is exactly the kind of thing `write_atomic` cannot make
-//! safe on its own (last write wins either way), and the simplest way to
-//! not have that race is to have only one writer at all. If the popup
-//! ever needs to change history state (pin, remove), that has to become
-//! a request *to this daemon*, not a second writer.
+//! This crate used to say there was no IPC here at all: no socket, no
+//! D-Bus name, nothing a popup could ask this daemon to do. That is no
+//! longer true — [`hyprforge_clipboard::ipc`] runs a control socket at
+//! `$XDG_RUNTIME_DIR/clipd.sock` so the popup can ask this daemon to pin,
+//! unpin or remove an entry, and list or check on the history it keeps.
+//! What has not changed, and is the reason this is safe, is *why* there
+//! was no IPC before: two writers racing to save the same index file —
+//! the daemon recording a new copy while a popup saved a pin toggle
+//! directly — is exactly the kind of thing `write_atomic` cannot make
+//! safe on its own (last write wins either way), and the fix was never
+//! "add locking to the file", it was "have only one writer at all". This
+//! daemon still is that one writer: [`History::save`] is called from
+//! exactly two places in this process — the watcher loop below, and the
+//! control socket's request handler in `ipc.rs` — and both hold the same
+//! `tokio::sync::Mutex<History>` (see [`ipc::Shared`]) while they touch
+//! it, so a pin request and an incoming copy still cannot interleave
+//! into two half-applied writes. The popup gained a way to change
+//! history state; it did not gain a second path to the file. That request
+//! channel is exactly what this module doc used to say would have to
+//! exist before the popup could ask for a pin or a remove at all.
+//!
+//! # Protocol
+//!
+//! One JSON object per line over the socket, request → response,
+//! modelled on `notif-ipc` (see [`hyprforge_clipboard::ipc`] for the
+//! full doc, including why nothing here logs an entry's content):
+//!
+//! | Request                              | Response                     |
+//! |----------------------------------------|-------------------------------|
+//! | `{"cmd":"pin","id":"<entry id>"}`       | `{"ok":true}`                 |
+//! | `{"cmd":"unpin","id":"<entry id>"}`     | `{"ok":true}`                 |
+//! | `{"cmd":"remove","id":"<entry id>"}`    | `{"ok":true}`                 |
+//! | `{"cmd":"list"}`                        | `{"ok":true,"entries":[…]}`   |
+//! | `{"cmd":"status"}`                      | `{"ok":true,"status":{…}}`    |
+//! | unknown / malformed                     | `{"ok":false,"error":"…"}`    |
 //!
 //! # Startup: a missing history is not the same as a broken one
 //!
@@ -30,10 +54,12 @@
 //! had — the exact mistake `hlconfig::storage` and `hyprforge-tray`'s
 //! `prefs::load_from` both already avoid.
 
+use hyprforge_clipboard::ipc::Shared;
 use hyprforge_clipboard::{
     ClipboardWatcher, Entry, History, Recordable, Sensitivity, WaylandWatcher,
 };
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// How long to wait before trying to (re)connect to the compositor's
@@ -55,7 +81,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let (mut history, can_save) = load_history();
+    let (history, can_save) = load_history();
     tracing::info!(
         entries = history.entries().len(),
         can_save,
@@ -75,11 +101,32 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // One `History` behind one lock, shared between the watcher loop
+    // below and every control-socket connection in `ipc.rs` — see this
+    // module's doc on why that lock is what keeps this the only writer.
+    let shared = Arc::new(Shared {
+        history: tokio::sync::Mutex::new(history),
+        can_save,
+    });
+
+    let ipc_shared = Arc::clone(&shared);
+    tokio::spawn(async move {
+        if let Err(e) = hyprforge_clipboard::ipc::run(ipc_shared).await {
+            // Fatal only for the socket, not for this daemon: a clipboard
+            // manager that can still record copies but cannot take pin
+            // requests is in a worse state than before, not a state
+            // worth exiting the whole process over. The popup will see
+            // "daemon not running" for its own connection attempts,
+            // which is the client's problem to report — see CLAUDE.md.
+            tracing::error!(error = %e, "clipboard control socket is not running");
+        }
+    });
+
     loop {
         match WaylandWatcher::connect() {
             Ok(watcher) => {
                 tracing::info!("connected to the compositor's clipboard");
-                run_until_disconnected(&watcher, &mut history, can_save).await;
+                run_until_disconnected(&watcher, &shared).await;
                 tracing::warn!(
                     "clipboard watcher stopped delivering entries; the compositor connection \
                      likely died. Reconnecting."
@@ -96,7 +143,7 @@ async fn main() -> anyhow::Result<()> {
 /// Drains the watcher's channel until it closes (the dispatch thread on
 /// the other end died — see `wayland::ext`/`wayland::wlr`'s `Finished`
 /// handling), recording each entry as it arrives.
-async fn run_until_disconnected(watcher: &WaylandWatcher, history: &mut History, can_save: bool) {
+async fn run_until_disconnected(watcher: &WaylandWatcher, shared: &Shared) {
     let mut entries = watcher.subscribe();
     while let Some(entry) = entries.recv().await {
         // Never log the content — only its id (a content hash, not the
@@ -104,7 +151,13 @@ async fn run_until_disconnected(watcher: &WaylandWatcher, history: &mut History,
         let id = entry.id.clone();
         let size = entry.content.size();
         let now = now_unix();
-        if record(history, entry, now) {
+
+        // Same lock the control socket takes around a request — see the
+        // module doc. Held only across the record-and-maybe-save pair
+        // below, never across the `.recv().await` above, so a pin
+        // request is never blocked on the next clipboard copy arriving.
+        let mut history = shared.history.lock().await;
+        if record(&mut history, entry, now) {
             tracing::info!(id = ?id, size, "recorded a clipboard entry");
         } else {
             // `record`/`History::record` refused it (empty, or over the
@@ -114,7 +167,7 @@ async fn run_until_disconnected(watcher: &WaylandWatcher, history: &mut History,
             continue;
         }
 
-        if can_save {
+        if shared.can_save {
             if let Err(e) = history.save() {
                 tracing::error!(error = %e, "failed to save clipboard history; will retry on the next copy");
             }

@@ -238,6 +238,20 @@ impl fmt::Debug for Entry {
 pub struct EntryId(String);
 
 impl EntryId {
+    /// Wraps an already-known id string, without hashing anything.
+    ///
+    /// For looking an entry up by an id a caller already has — an IPC
+    /// request naming the entry to pin or remove — never for minting a
+    /// *new* entry's id. [`EntryId::of`] stays the only way to do that,
+    /// so an id can never silently drift out of sync with what it is
+    /// supposed to be a hash of. An id is a content hash, not the
+    /// content itself, so accepting one from a request and comparing it
+    /// against stored entries carries none of the "never log a
+    /// keystroke" risk the rest of this module protects against.
+    pub fn from_raw(id: impl Into<String>) -> Self {
+        EntryId(id.into())
+    }
+
     /// Derived from the bytes, never from the time or a counter: the
     /// point is that copying the same thing again is recognised.
     pub fn of(content: &Content) -> Self {

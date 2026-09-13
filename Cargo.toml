@@ -68,10 +68,22 @@ anyhow = "1"
 # (non-dev) dependency because the paste-synthesis code path needs it
 # outside tests, not only the test suite that also uses it.
 tempfile = "3"
-# `sync` for the `UnboundedReceiver` the watcher trait hands back;
-# `rt-multi-thread` and `macros` for the daemon's `#[tokio::main]`;
-# `time` for its bounded reconnect backoff.
-tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time"] }
+# `sync` for the `UnboundedReceiver` the watcher trait hands back and
+# for the `Mutex` the control socket and the watcher loop share one
+# `History` through; `rt-multi-thread` and `macros` for the daemon's
+# `#[tokio::main]`; `time` for its bounded reconnect backoff and the
+# control socket's idle-connection timeout; `net` and `io-util` for the
+# control socket itself (`UnixListener`/`UnixStream`, `BufReader`,
+# `AsyncBufReadExt`/`AsyncWriteExt`) — see `ipc.rs`.
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+# The IPC wire protocol, mirroring `notif-ipc`'s use of the same crate.
+# An explicit version, not `.workspace = true`, like every other
+# dependency in this manifest — this crate has to build standalone
+# outside the workspace too (see the `hyprforge-paths`/`hyprforge-secret`
+# comment below), where there is no `[workspace.dependencies]` to
+# inherit from. Inside the workspace this still resolves to the same
+# `serde_json = "1"` several other crates already depend on.
+serde_json = "1"
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "sync", "time", "test-util"] }

@@ -195,7 +195,11 @@ impl History {
         });
     }
 
-    fn total_bytes(&self) -> u64 {
+    /// Total bytes across every kept entry — the same accounting
+    /// [`Self::enforce_caps`] uses against [`MAX_TOTAL_BYTES`]. Exposed
+    /// for a `status` query so a caller can see how close the history is
+    /// to that cap without duplicating the accounting itself.
+    pub fn total_bytes(&self) -> u64 {
         self.entries.iter().map(|e| e.content.size() as u64).sum()
     }
 

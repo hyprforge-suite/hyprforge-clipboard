@@ -16,6 +16,7 @@
 //! content, for the same reason `hyprforge-authui` hand-writes its own.
 
 pub mod backend;
+pub mod ipc;
 pub mod paste;
 pub mod resolve;
 pub mod store;
