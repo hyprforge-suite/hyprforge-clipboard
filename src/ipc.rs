@@ -75,6 +75,7 @@
 use crate::store::History;
 use crate::types::EntryId;
 use serde::{Deserialize, Serialize};
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -227,8 +228,8 @@ pub fn handle_line(history: &mut History, can_save: bool, line: &str) -> (String
 
 fn dispatch(history: &mut History, can_save: bool, request: Request) -> (Response, bool) {
     match request {
-        Request::Pin { id } => set_pinned(history, can_save, id, true),
-        Request::Unpin { id } => set_pinned(history, can_save, id, false),
+        Request::Pin { id } => apply_pin(history, can_save, id, true),
+        Request::Unpin { id } => apply_pin(history, can_save, id, false),
         Request::Remove { id } => remove(history, can_save, id),
         Request::List => (
             Response::Entries {
@@ -251,7 +252,7 @@ fn dispatch(history: &mut History, can_save: bool, request: Request) -> (Respons
     }
 }
 
-fn set_pinned(history: &mut History, can_save: bool, id: String, pinned: bool) -> (Response, bool) {
+fn apply_pin(history: &mut History, can_save: bool, id: String, pinned: bool) -> (Response, bool) {
     if !can_save {
         return (err(unsavable_message()), false);
     }
@@ -296,6 +297,139 @@ fn summarize(entry: &crate::types::Entry) -> EntrySummary {
         preview: entry.content.preview(120),
         size: entry.content.size(),
     }
+}
+
+// ── The blocking client ──────────────────────────────────────────────────
+//
+// `hyprforge-clipmenu` is the one caller: a short-lived popup that asks
+// the daemon to pin or unpin an entry and needs an answer before it can
+// keep going. Defined beside the server, over the same [`Request`]/JSON
+// line the server already speaks, so the protocol has one definition
+// rather than the popup hand-rolling a second one.
+//
+// This is deliberately synchronous, over `std::os::unix::net::UnixStream`
+// rather than `tokio`: the popup has no other use for an async runtime,
+// and "connect, write one line, read one line" needs nothing more than a
+// blocking socket with a read/write deadline set on it.
+
+/// How long [`set_pinned`] waits for a response before giving up. Short,
+/// because a user is waiting on this as a UI action — CLAUDE.md is
+/// explicit that nothing here waits on another process without a bound,
+/// and a popup that hung for even a few seconds on a dead or wedged
+/// daemon would look broken.
+pub const CLIENT_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Everything that can go wrong asking the daemon to change a pin.
+///
+/// Kept distinct from [`IpcError`] (the server's own startup errors):
+/// this is what a *caller* sees, and the caller has to tell "there was
+/// nobody to ask" apart from "I asked and was refused" — CLAUDE.md is
+/// explicit that a service that is not running is a state with its own
+/// message, never folded into an ordinary failure, and that state is
+/// never cached: every call reconnects from scratch, so a daemon that
+/// starts up after a failed attempt is reachable on the very next one.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ClientError {
+    /// `$XDG_RUNTIME_DIR` is not set — nowhere to even look for a
+    /// socket.
+    #[error("$XDG_RUNTIME_DIR is not set")]
+    NoRuntimeDir,
+    /// Couldn't connect at all. In practice this is almost always
+    /// `hyprforge-clipd` not running — a missing socket file behaves the
+    /// same as a refused connection from this side, and there is no
+    /// value in telling them apart for a caller that only wants to know
+    /// whether pinning is possible right now.
+    #[error("couldn't reach hyprforge-clipd: {0}")]
+    Unreachable(String),
+    /// Connected, but no complete response arrived within
+    /// [`CLIENT_TIMEOUT`]. A daemon that accepted the connection and
+    /// then never answered — wedged, or overloaded — must not hang this
+    /// caller either, so this is reported the same as any other failure
+    /// to reach it rather than left to block.
+    #[error("hyprforge-clipd did not respond in time")]
+    Timeout,
+    /// A response arrived but was not the JSON object every response in
+    /// the protocol table is documented to be.
+    #[error("hyprforge-clipd sent a response this client could not understand")]
+    Malformed,
+    /// The daemon understood the request and refused it — `can_save`
+    /// was false, or the id named no entry. Carries the daemon's own
+    /// message, which never contains clipboard content (see this
+    /// module's "Never log clipboard content" section) — only an id (a
+    /// hash) and the reason.
+    #[error("{0}")]
+    Refused(String),
+}
+
+fn client_socket_error(error: std::io::Error) -> ClientError {
+    match error.kind() {
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => ClientError::Timeout,
+        _ => ClientError::Unreachable(error.to_string()),
+    }
+}
+
+/// Sends one request line to the socket at `path` and interprets the one
+/// response line that comes back. No I/O happens beyond that single
+/// round trip — the connection is closed (by `stream` going out of
+/// scope) as soon as this returns, since every caller today needs
+/// exactly one request answered, not a kept-open session.
+fn request_at(path: &Path, request: &Request, timeout: Duration) -> Result<(), ClientError> {
+    let mut stream = std::os::unix::net::UnixStream::connect(path).map_err(client_socket_error)?;
+    // Both directions get the same bound: a write can block too, on a
+    // kernel socket buffer that never drains because nothing on the
+    // other end is reading.
+    stream.set_read_timeout(Some(timeout)).ok();
+    stream.set_write_timeout(Some(timeout)).ok();
+
+    let line = serde_json::to_string(request).expect("Request always serialises");
+    stream
+        .write_all(format!("{line}\n").as_bytes())
+        .map_err(client_socket_error)?;
+
+    let mut reader = std::io::BufReader::new(stream);
+    let mut response_line = String::new();
+    let read = reader.read_line(&mut response_line).map_err(client_socket_error)?;
+    if read == 0 {
+        return Err(ClientError::Unreachable(
+            "connection closed with no response".to_string(),
+        ));
+    }
+
+    let value: serde_json::Value =
+        serde_json::from_str(response_line.trim()).map_err(|_| ClientError::Malformed)?;
+    match value.get("ok").and_then(|v| v.as_bool()) {
+        Some(true) => Ok(()),
+        Some(false) => {
+            let message = value
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("request refused")
+                .to_string();
+            Err(ClientError::Refused(message))
+        }
+        None => Err(ClientError::Malformed),
+    }
+}
+
+/// Asks `hyprforge-clipd` at the default socket path to pin or unpin
+/// `id`. See [`request_at`] for what actually happens on the wire, and
+/// this module's doc for why nothing here ever calls [`History::save`]
+/// itself — this only ever asks the daemon to.
+pub fn set_pinned(id: &str, pinned: bool) -> Result<(), ClientError> {
+    let path = socket_path().map_err(|_| ClientError::NoRuntimeDir)?;
+    set_pinned_at(&path, id, pinned, CLIENT_TIMEOUT)
+}
+
+/// [`set_pinned`] against an explicit socket `path` and `timeout` — the
+/// seam the tests below use to talk to a throwaway daemon instead of
+/// `$XDG_RUNTIME_DIR`'s real one.
+pub fn set_pinned_at(path: &Path, id: &str, pinned: bool, timeout: Duration) -> Result<(), ClientError> {
+    let request = if pinned {
+        Request::Pin { id: id.to_string() }
+    } else {
+        Request::Unpin { id: id.to_string() }
+    };
+    request_at(path, &request, timeout)
 }
 
 // ── The socket layer ────────────────────────────────────────────────────
@@ -609,6 +743,128 @@ mod tests {
                 history.entries()[0].pinned,
                 "the shared History was mutated"
             );
+        }
+
+        server.abort();
+    }
+
+    // ── The blocking client, against a real (throwaway) socket ─────────
+
+    /// The client's happy path: a real `run_at` server, on a tempdir
+    /// socket, actually flips the pin and reports success — proving the
+    /// client and the server agree on the wire format, not just that
+    /// `handle_line` parses what the client happens to send.
+    #[tokio::test]
+    async fn the_client_pins_an_entry_against_a_real_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clipd-client-test.sock");
+        let (history, id) = history_with_one_entry();
+        let shared = Arc::new(Shared { history: Mutex::new(history), can_save: true });
+
+        let serve_path = path.clone();
+        let serve_shared = Arc::clone(&shared);
+        let server = tokio::spawn(async move {
+            let _ = run_at(&serve_path, serve_shared).await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The client is synchronous, so it runs on a blocking thread —
+        // `spawn_blocking` is only this test's plumbing to call it from
+        // an async test, not something the client itself needs.
+        let client_path = path.clone();
+        let client_id = id.as_str().to_string();
+        tokio::task::spawn_blocking(move || {
+            set_pinned_at(&client_path, &client_id, true, Duration::from_secs(2))
+        })
+        .await
+        .unwrap()
+        .expect("pin must succeed against a running daemon");
+
+        {
+            let history = shared.history.lock().await;
+            assert!(history.entries()[0].pinned, "the daemon's own History was mutated");
+        }
+
+        server.abort();
+    }
+
+    /// The failure case that matters most: nothing is listening at all.
+    /// This must come back quickly as a distinct, actionable error —
+    /// never hang, and never look like the pin succeeded.
+    #[test]
+    fn pinning_with_no_daemon_running_fails_fast_and_names_the_problem() {
+        let dir = tempfile::tempdir().unwrap();
+        // A path where nothing has ever bound a socket.
+        let path = dir.path().join("nobody-home.sock");
+        let started = std::time::Instant::now();
+        let result = set_pinned_at(&path, "some-id", true, Duration::from_secs(2));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a refused connection must fail immediately, not wait out the timeout"
+        );
+        assert!(
+            matches!(result, Err(ClientError::Unreachable(_))),
+            "got {result:?}"
+        );
+    }
+
+    /// A connection that is accepted but never answered must still be
+    /// bounded — CLAUDE.md's rule against waiting on another process
+    /// without one, applied to this client specifically.
+    #[test]
+    fn a_daemon_that_never_answers_times_out_rather_than_hanging_forever() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("silent.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let accept_thread = std::thread::spawn(move || {
+            // Accept the connection and then do nothing at all with it —
+            // simulating a wedged daemon that took the request and never
+            // replied.
+            let _kept_alive = listener.accept();
+            std::thread::sleep(Duration::from_secs(5));
+        });
+
+        let started = std::time::Instant::now();
+        let result = set_pinned_at(&path, "some-id", true, Duration::from_millis(200));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "must give up within roughly the requested timeout, not wait for the peer"
+        );
+        assert!(matches!(result, Err(ClientError::Timeout)), "got {result:?}");
+
+        drop(accept_thread); // detached; the test process exits regardless
+    }
+
+    /// The daemon's refusal (can_save == false) must reach the client as
+    /// its own distinct outcome, carrying the daemon's message, rather
+    /// than being reported as success or as a generic unreachable error.
+    #[tokio::test]
+    async fn a_refusal_from_the_daemon_is_reported_not_swallowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clipd-refuse-test.sock");
+        let (history, id) = history_with_one_entry();
+        let shared = Arc::new(Shared { history: Mutex::new(history), can_save: false });
+
+        let serve_path = path.clone();
+        let serve_shared = Arc::clone(&shared);
+        let server = tokio::spawn(async move {
+            let _ = run_at(&serve_path, serve_shared).await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let client_path = path.clone();
+        let client_id = id.as_str().to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            set_pinned_at(&client_path, &client_id, true, Duration::from_secs(2))
+        })
+        .await
+        .unwrap();
+
+        match result {
+            Err(ClientError::Refused(message)) => {
+                assert!(message.contains("could not be parsed"), "got {message:?}");
+            }
+            other => panic!("expected a Refused error, got {other:?}"),
         }
 
         server.abort();

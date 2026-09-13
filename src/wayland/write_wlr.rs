@@ -11,10 +11,11 @@ use crate::wayland::pipe;
 use crate::write::{bytes_for, mimes_to_offer, SelectionOutcome, Waiter};
 use std::sync::Arc;
 use wayland_client::protocol::{wl_registry, wl_seat};
-use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
+use wayland_client::{event_created_child, Connection, Dispatch, Proxy, QueueHandle};
 use wayland_protocols_wlr::data_control::v1::client::{
     zwlr_data_control_device_v1::{self, ZwlrDataControlDeviceV1},
     zwlr_data_control_manager_v1::{self, ZwlrDataControlManagerV1},
+    zwlr_data_control_offer_v1::ZwlrDataControlOfferV1,
     zwlr_data_control_source_v1::{self, ZwlrDataControlSourceV1},
 };
 
@@ -93,6 +94,15 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for State {
             state.waiter.signal(SelectionOutcome::Superseded);
         }
     }
+
+    // The same specialization `write_ext.rs` needs, for the same reason
+    // and with the same consequence if it is missing — see the long
+    // comment there. This path is the *fallback*, so it going wrong is
+    // even quieter: it is only reached once ext-data-control has already
+    // failed, and there is nothing after it to fall back to.
+    event_created_child!(State, ZwlrDataControlDeviceV1, [
+        zwlr_data_control_device_v1::EVT_DATA_OFFER_OPCODE => (ZwlrDataControlOfferV1, ()),
+    ]);
 }
 
 impl Dispatch<ZwlrDataControlSourceV1, ()> for State {
@@ -179,4 +189,18 @@ pub fn set_selection(content: Content) -> anyhow::Result<Arc<Waiter>> {
         })?;
 
     Ok(waiter)
+}
+
+/// Offers this writer is handed and never reads — see `write_ext.rs`'s
+/// equivalent for why accepting them at all is the point.
+impl Dispatch<ZwlrDataControlOfferV1, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &ZwlrDataControlOfferV1,
+        _: <ZwlrDataControlOfferV1 as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }

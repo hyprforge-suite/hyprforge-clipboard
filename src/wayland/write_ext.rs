@@ -40,10 +40,11 @@ use crate::wayland::pipe;
 use crate::write::{bytes_for, mimes_to_offer, SelectionOutcome, Waiter};
 use std::sync::Arc;
 use wayland_client::protocol::{wl_registry, wl_seat};
-use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
+use wayland_client::{event_created_child, Connection, Dispatch, Proxy, QueueHandle};
 use wayland_protocols::ext::data_control::v1::client::{
     ext_data_control_device_v1::{self, ExtDataControlDeviceV1},
     ext_data_control_manager_v1::{self, ExtDataControlManagerV1},
+    ext_data_control_offer_v1::ExtDataControlOfferV1,
     ext_data_control_source_v1::{self, ExtDataControlSourceV1},
 };
 
@@ -129,6 +130,22 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for State {
             state.waiter.signal(SelectionOutcome::Superseded);
         }
     }
+
+    // Not optional, however little this writer cares about `data_offer`.
+    // The compositor sends one to *every* data-control device whenever
+    // the selection changes — including the change this writer just
+    // made — and `wayland-client` cannot deliver an event that creates a
+    // child object unless it is told how to build it. Without this it
+    // does not ignore the event, it panics: "Missing event_created_child
+    // specialization for event opcode 0". That panic happened on the
+    // dispatch thread spawned by `set_selection`, after it had already
+    // returned `Ok`, so the fallback to zwlr-data-control never ran and
+    // nothing was left alive to serve the selection. The clipboard went
+    // empty and pasting did nothing, with no error anywhere the user
+    // could see it.
+    event_created_child!(State, ExtDataControlDeviceV1, [
+        ext_data_control_device_v1::EVT_DATA_OFFER_OPCODE => (ExtDataControlOfferV1, ()),
+    ]);
 }
 
 impl Dispatch<ExtDataControlSourceV1, ()> for State {
@@ -233,4 +250,24 @@ pub fn set_selection(content: Content) -> anyhow::Result<Arc<Waiter>> {
         })?;
 
     Ok(waiter)
+}
+
+/// The offers this writer is handed but never reads.
+///
+/// `event_created_child!` above makes the device able to *build* an
+/// offer; this makes the offer able to receive the `offer` events that
+/// follow it. Both halves are needed, and neither does anything with
+/// what arrives — reading a selection is `ext.rs`'s job. Dropping the
+/// events on the floor here is the deliberate part; failing to accept
+/// them at all was the bug.
+impl Dispatch<ExtDataControlOfferV1, ()> for State {
+    fn event(
+        _: &mut Self,
+        _: &ExtDataControlOfferV1,
+        _: <ExtDataControlOfferV1 as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }
