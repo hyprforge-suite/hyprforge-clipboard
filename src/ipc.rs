@@ -27,6 +27,7 @@
 //! | `{"cmd":"unpin","id":"<entry id>"}`         | `{"ok":true}`                                |
 //! | `{"cmd":"remove","id":"<entry id>"}`        | `{"ok":true}`                                |
 //! | `{"cmd":"set-clipboard","id":"<entry id>"}` | `{"ok":true}`                                |
+//! | `{"cmd":"set-clipboard-text","text":"<s>"}` | `{"ok":true}`                                |
 //! | `{"cmd":"list"}`                            | `{"ok":true,"entries":[…]}`                  |
 //! | `{"cmd":"status"}`                          | `{"ok":true,"status":{…}}`                   |
 //! | unknown / malformed                         | `{"ok":false,"error":"…"}`                   |
@@ -55,6 +56,23 @@
 //! stay independent: a broken history file still blocks *saving*
 //! mutations, but it never blocks reading an entry that already made it
 //! into memory and putting it back on the clipboard.
+//!
+//! # `set-clipboard-text`: the same, for content this daemon never recorded
+//!
+//! `set-clipboard` only ever reaches content this daemon already has in
+//! memory, keyed by an id from its own history — there was no caller
+//! that needed anything else until `hyprforge-emojimenu`. An emoji a
+//! person just picked was never copied through the clipboard watcher, so
+//! it has no history entry and no id to name; asking this daemon to hold
+//! it open for repeat-paste needs a way in that does not go through
+//! [`History`] at all. `set-clipboard-text` is that: it carries the text
+//! itself rather than a reference to it, skips [`History`] entirely (no
+//! lookup, no `can_save` gate — there is nothing here that could ever be
+//! "unparsed"), and otherwise takes over `*selection` exactly the way
+//! `set-clipboard` does, for exactly the same reason (see
+//! [`Shared::selection`]'s doc). Text only, deliberately: an emoji is
+//! never an image, and adding an image variant with no caller to
+//! exercise it would be an untested path the moment it landed.
 //!
 //! The connection stays open after a response; a client may send
 //! multiple requests before closing. Malformed requests do **not** close
@@ -154,6 +172,12 @@ pub enum Request {
     /// doc's "`set-clipboard`: the daemon becomes the selection's
     /// owner".
     SetClipboard { id: String },
+    /// Put `text` itself back on the clipboard, with this daemon as the
+    /// source that serves it — the same ownership `SetClipboard` gives
+    /// an already-recorded entry, for content (an emoji, say) this
+    /// daemon never recorded and has no id for. See the module doc's
+    /// "`set-clipboard-text`" section.
+    SetClipboardText { text: String },
     /// The full history, in display order.
     List,
     /// Whether this daemon is alive, and how healthy its history is.
@@ -285,6 +309,7 @@ fn dispatch<W: ClipboardWriter>(
         Request::Unpin { id } => apply_pin(history, can_save, id, false),
         Request::Remove { id } => remove(history, can_save, id),
         Request::SetClipboard { id } => apply_set_clipboard(history, writer, selection, id),
+        Request::SetClipboardText { text } => apply_set_clipboard_text(writer, selection, text),
         Request::List => (
             Response::Entries {
                 ok: true,
@@ -362,6 +387,26 @@ fn apply_set_clipboard<W: ClipboardWriter>(
             // derived from what was copied.
             Err(e) => (err(format!("failed to set the clipboard: {e}")), false),
         },
+    }
+}
+
+/// `set-clipboard-text`: puts `text` on the clipboard through `writer`,
+/// replacing `*selection` with the new guard — the same mechanics as
+/// [`apply_set_clipboard`], minus the [`History`] lookup, since there is
+/// no entry to look up (see the module doc). Never a `History` mutation
+/// either, for the same reason.
+fn apply_set_clipboard_text<W: ClipboardWriter>(
+    writer: &W,
+    selection: &mut Option<W::Guard>,
+    text: String,
+) -> (Response, bool) {
+    match writer.set_selection(Content::Text(text)) {
+        Ok(guard) => {
+            *selection = Some(guard);
+            (Response::Ok, false)
+        }
+        // Never the content — same rule `apply_set_clipboard` follows.
+        Err(e) => (err(format!("failed to set the clipboard: {e}")), false),
     }
 }
 
@@ -572,6 +617,30 @@ pub fn set_clipboard_at(path: &Path, id: &str, timeout: Duration) -> Result<(), 
     request_at(path, &Request::SetClipboard { id: id.to_string() }, timeout)
 }
 
+/// Asks `hyprforge-clipd` at the default socket path to put `text`
+/// itself back on the clipboard, with the daemon holding the selection
+/// open afterward — [`set_clipboard`] for content that was never copied
+/// through this daemon's own history (an emoji a picker just chose, with
+/// no id to name), so there is nothing to look up here at all. See the
+/// module doc's "`set-clipboard-text`" section.
+///
+/// [`ClientError::Unreachable`]/[`ClientError::NoRuntimeDir`] mean the
+/// same thing [`set_clipboard`]'s doc already gives them: nobody to ask,
+/// not a refusal — the caller's own fallback (owning the selection
+/// itself, as `hyprforge-clipmenu`'s `chooser::Wired` already does for
+/// the identical case) is exactly as appropriate here.
+pub fn set_clipboard_text(text: &str) -> Result<(), ClientError> {
+    let path = socket_path().map_err(|_| ClientError::NoRuntimeDir)?;
+    set_clipboard_text_at(&path, text, CLIENT_TIMEOUT)
+}
+
+/// [`set_clipboard_text`] against an explicit socket `path` and
+/// `timeout` — the seam the tests below use to talk to a throwaway
+/// daemon instead of `$XDG_RUNTIME_DIR`'s real one.
+pub fn set_clipboard_text_at(path: &Path, text: &str, timeout: Duration) -> Result<(), ClientError> {
+    request_at(path, &Request::SetClipboardText { text: text.to_string() }, timeout)
+}
+
 // ── The socket layer ────────────────────────────────────────────────────
 
 /// State shared between the clipboard watcher loop and every IPC
@@ -707,6 +776,9 @@ where
         Ok(Request::SetClipboard { id }) => {
             to_json(&set_clipboard_on_daemon(Arc::clone(shared), id).await)
         }
+        Ok(Request::SetClipboardText { text }) => {
+            to_json(&set_clipboard_text_on_daemon(Arc::clone(shared), text).await)
+        }
         Ok(request) => {
             let mut history = shared.history.lock().await;
             let mut no_writer_needed = None; // none of these variants touch `writer`/`selection`
@@ -779,6 +851,30 @@ where
             // as a reason to do anything more drastic.
             err("internal error setting the clipboard".to_string())
         }
+    }
+}
+
+/// The `set-clipboard-text` counterpart to [`set_clipboard_on_daemon`]:
+/// the same unbounded Wayland round trip on a blocking thread with no
+/// lock held across it, but with no [`History`] lookup at all — there is
+/// no id, only `text` itself (see the module doc's "`set-clipboard-text`"
+/// section and [`apply_set_clipboard_text`]'s doc for why).
+async fn set_clipboard_text_on_daemon<W: ClipboardWriter + 'static>(shared: Arc<Shared<W>>, text: String) -> Response
+where
+    W::Guard: 'static,
+{
+    let blocking_shared = Arc::clone(&shared);
+    let result =
+        tokio::task::spawn_blocking(move || blocking_shared.writer.set_selection(Content::Text(text))).await;
+
+    match result {
+        Ok(Ok(guard)) => {
+            let mut selection = shared.selection.lock().await;
+            *selection = Some(guard);
+            Response::Ok
+        }
+        Ok(Err(e)) => err(format!("failed to set the clipboard: {e}")),
+        Err(_join_error) => err("internal error setting the clipboard".to_string()),
     }
 }
 
@@ -1281,6 +1377,95 @@ mod tests {
         let line = format!(r#"{{"cmd":"set-clipboard","id":"{}"}}"#, id.as_str());
 
         let (response, mutated) = handle_line(&mut history, true, &writer, &mut selection, &line);
+
+        assert!(!mutated);
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["ok"], false);
+        assert!(selection.is_none());
+    }
+
+    // ── set-clipboard-text ───────────────────────────────────────────
+
+    /// The whole point: `text` reaches the writer with no `History`
+    /// lookup involved at all — an empty history still succeeds, which
+    /// `set-clipboard` (by id) never could.
+    #[test]
+    fn set_clipboard_text_hands_the_text_to_the_writer_with_no_history_entry_needed() {
+        let mut history = History::new();
+        let writer = crate::write::mock::MockWriter::new();
+        let mut selection = None;
+
+        let (response, mutated) =
+            handle_line(&mut history, true, &writer, &mut selection, r#"{"cmd":"set-clipboard-text","text":"👋"}"#);
+
+        assert_eq!(response, r#"{"ok":true}"#);
+        assert!(!mutated, "set-clipboard-text never touches the index file either");
+        assert_eq!(writer.calls(), vec![Content::Text("👋".into())]);
+        assert!(selection.is_some(), "the guard must be kept, exactly like set-clipboard");
+    }
+
+    /// Same replace-not-accumulate guarantee `set-clipboard` has, and the
+    /// same underlying `Option` assignment providing it — pinned
+    /// separately because `apply_set_clipboard_text` is its own function
+    /// with its own call to `writer.set_selection`, not a thin wrapper
+    /// that reuses `apply_set_clipboard`'s.
+    #[test]
+    fn setting_clipboard_text_a_second_time_replaces_rather_than_accumulates_the_guard() {
+        let mut history = History::new();
+        let writer = crate::write::mock::MockWriter::new();
+        let mut selection = None;
+
+        handle_line(&mut history, true, &writer, &mut selection, r#"{"cmd":"set-clipboard-text","text":"🔥"}"#);
+        assert!(selection.is_some());
+        handle_line(&mut history, true, &writer, &mut selection, r#"{"cmd":"set-clipboard-text","text":"❤️"}"#);
+
+        assert!(selection.is_some());
+        assert_eq!(writer.calls(), vec![Content::Text("🔥".into()), Content::Text("❤️".into())]);
+    }
+
+    /// Works even when the on-disk history could not be parsed — there
+    /// is no `History` read here at all, so `can_save` (which only ever
+    /// gates a *save*) cannot possibly be the reason this fails.
+    #[test]
+    fn set_clipboard_text_works_even_when_the_history_could_not_be_saved() {
+        let mut history = History::new();
+        let writer = crate::write::mock::MockWriter::new();
+        let mut selection = None;
+
+        let (response, mutated) = handle_line(
+            &mut history,
+            /* can_save */ false,
+            &writer,
+            &mut selection,
+            r#"{"cmd":"set-clipboard-text","text":"🎉"}"#,
+        );
+
+        assert!(!mutated);
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["ok"], true);
+        assert!(selection.is_some());
+    }
+
+    /// A writer failure is reported and leaves no stale guard — the same
+    /// property `a_writer_failure_is_reported_and_leaves_no_guard` pins
+    /// for `set-clipboard`.
+    #[test]
+    fn a_writer_failure_setting_clipboard_text_is_reported_and_leaves_no_guard() {
+        struct FailingWriter;
+        impl ClipboardWriter for FailingWriter {
+            type Guard = crate::write::mock::MockGuard;
+
+            fn set_selection(&self, _content: Content) -> anyhow::Result<Self::Guard> {
+                anyhow::bail!("no clipboard protocol available")
+            }
+        }
+
+        let mut history = History::new();
+        let writer = FailingWriter;
+        let mut selection = None;
+
+        let (response, mutated) =
+            handle_line(&mut history, true, &writer, &mut selection, r#"{"cmd":"set-clipboard-text","text":"🎉"}"#);
 
         assert!(!mutated);
         let value: serde_json::Value = serde_json::from_str(&response).unwrap();
