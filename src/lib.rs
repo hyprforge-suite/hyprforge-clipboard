@@ -25,7 +25,7 @@ pub mod wayland;
 pub mod write;
 
 pub use backend::ClipboardWatcher;
-pub use paste::{PasteOutcome, PasteSynthesizer};
+pub use paste::{PasteOutcome, PasteSynthesizer, Shortcut};
 pub use store::{History, HistoryError, Recordable};
 pub use types::{Content, Entry, EntryId, Mime, Sensitivity};
 pub use wayland::{WaylandPaster, WaylandWatcher, WaylandWriter};

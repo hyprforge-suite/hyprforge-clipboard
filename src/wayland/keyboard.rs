@@ -39,7 +39,7 @@
 //! release that could succeed for one and fail for the other and leave
 //! Ctrl depressed on the user's real keyboard afterward.
 
-use crate::paste::PasteOutcome;
+use crate::paste::{PasteOutcome, Shortcut};
 use std::os::fd::AsFd;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -56,6 +56,8 @@ use xkbcommon::xkb;
 /// which is this value plus 8; see the module doc on why that offset
 /// belongs to the keymap compiler, not to this request).
 const KEY_LEFTCTRL: u32 = 29;
+/// `KEY_LEFTSHIFT`, same source — needed for [`Shortcut::CtrlShiftV`].
+const KEY_LEFTSHIFT: u32 = 42;
 /// `KEY_V`, same source.
 const KEY_V: u32 = 47;
 
@@ -147,27 +149,74 @@ struct Inner {
     /// but reading it from the keymap that was actually compiled is what
     /// makes this correct rather than merely usually-correct.
     ctrl_bit: u32,
+    /// The bit `modifiers()` must set to mean "Shift is held", read back
+    /// from the compiled keymap the same way [`Self::ctrl_bit`] is, and
+    /// for the same reason: assumed bit orderings are the kind of thing
+    /// that is merely usually correct.
+    shift_bit: u32,
     /// One shared clock for every `key`/`modifiers` request on this
     /// keyboard object, per the protocol's own requirement ("all
     /// requests regarding a single object must share the same clock").
     started: Instant,
 }
 
+/// One queued `zwp_virtual_keyboard_v1` request, exactly as
+/// [`combo_requests`] would have it sent — kept apart from the actual
+/// proxy calls so the *sequence* (every press paired with a release,
+/// modifiers cleared at the end) can be pinned by a test with no
+/// compositor, no `Connection`, and no proxy object at all. `Inner::send_combo`
+/// is the only place these are ever turned into real protocol requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Request {
+    /// `zwp_virtual_keyboard_v1.modifiers(mods_depressed, 0, 0, 0)`.
+    Modifiers(u32),
+    /// `zwp_virtual_keyboard_v1.key(_, keycode, state)` — the time
+    /// argument is filled in by the caller, since it is a per-call clock
+    /// reading rather than anything this sequence itself decides.
+    Key(u32, u32),
+}
+
+/// The full request sequence for one [`Shortcut`]: modifiers set before
+/// any key, every press immediately followed later by its matching
+/// release, and the modifier state cleared *unconditionally* as the very
+/// last request — regardless of `shortcut`, so there is no path through
+/// this function that presses Shift or Ctrl and forgets to let go of it.
+/// Pulled out as a pure function (no `Connection`, no proxy) precisely so
+/// that guarantee can be pinned by a test without a compositor — see this
+/// module's own tests below.
+fn combo_requests(shortcut: Shortcut, ctrl_bit: u32, shift_bit: u32) -> Vec<Request> {
+    let shift = matches!(shortcut, Shortcut::CtrlShiftV);
+    let mods = ctrl_bit | if shift { shift_bit } else { 0 };
+
+    let mut requests = vec![Request::Modifiers(mods), Request::Key(KEY_LEFTCTRL, KEY_STATE_PRESSED)];
+    if shift {
+        requests.push(Request::Key(KEY_LEFTSHIFT, KEY_STATE_PRESSED));
+    }
+    requests.push(Request::Key(KEY_V, KEY_STATE_PRESSED));
+    requests.push(Request::Key(KEY_V, KEY_STATE_RELEASED));
+    if shift {
+        requests.push(Request::Key(KEY_LEFTSHIFT, KEY_STATE_RELEASED));
+    }
+    requests.push(Request::Key(KEY_LEFTCTRL, KEY_STATE_RELEASED));
+    // Unconditional: always the last request appended, regardless of
+    // `shift` — see this function's own doc.
+    requests.push(Request::Modifiers(0));
+    requests
+}
+
 impl Inner {
-    /// Presses and releases Ctrl+V, queuing every request and flushing
-    /// exactly once — see the module doc's "never a stuck modifier"
-    /// section for why the flush is singular.
-    fn send_ctrl_v(&mut self) -> bool {
+    /// Presses and releases `shortcut`, queuing every request from
+    /// [`combo_requests`] and flushing exactly once — see the module
+    /// doc's "never a stuck modifier" section for why the flush is
+    /// singular.
+    fn send_combo(&mut self, shortcut: Shortcut) -> bool {
         let time = self.started.elapsed().as_millis() as u32;
-        self.keyboard.modifiers(self.ctrl_bit, 0, 0, 0);
-        self.keyboard.key(time, KEY_LEFTCTRL, KEY_STATE_PRESSED);
-        self.keyboard.key(time, KEY_V, KEY_STATE_PRESSED);
-        self.keyboard.key(time, KEY_V, KEY_STATE_RELEASED);
-        self.keyboard.key(time, KEY_LEFTCTRL, KEY_STATE_RELEASED);
-        // Unconditional: queued in the same batch regardless of what
-        // came before, so there is no code path that presses Ctrl and
-        // skips releasing it.
-        self.keyboard.modifiers(0, 0, 0, 0);
+        for request in combo_requests(shortcut, self.ctrl_bit, self.shift_bit) {
+            match request {
+                Request::Modifiers(mods) => self.keyboard.modifiers(mods, 0, 0, 0),
+                Request::Key(keycode, state) => self.keyboard.key(time, keycode, state),
+            }
+        }
 
         match self.connection.flush() {
             Ok(()) => true,
@@ -207,13 +256,13 @@ impl WaylandPaster {
 }
 
 impl crate::paste::PasteSynthesizer for WaylandPaster {
-    fn paste(&self) -> PasteOutcome {
+    fn paste(&self, shortcut: Shortcut) -> PasteOutcome {
         let Some(inner) = &self.inner else {
             return PasteOutcome::Unavailable;
         };
         let mut inner = inner.lock().unwrap_or_else(|e| e.into_inner());
-        if inner.send_ctrl_v() {
-            PasteOutcome::Sent
+        if inner.send_combo(shortcut) {
+            PasteOutcome::Dispatched
         } else {
             PasteOutcome::Unavailable
         }
@@ -242,7 +291,7 @@ fn try_connect() -> anyhow::Result<Inner> {
 
     let keyboard = manager.create_virtual_keyboard(&seat, &qh, ());
 
-    let (keymap_text, ctrl_bit) = compile_keymap()?;
+    let (keymap_text, ctrl_bit, shift_bit) = compile_keymap()?;
     upload_keymap(&keyboard, &keymap_text)?;
     connection.flush()?;
 
@@ -250,15 +299,16 @@ fn try_connect() -> anyhow::Result<Inner> {
         connection,
         keyboard,
         ctrl_bit,
+        shift_bit,
         started: Instant::now(),
     })
 }
 
 /// Compiles the system's ordinary "us" keyboard layout — see the module
 /// doc for why a real layout is used rather than a hand-written keymap
-/// naming only Control and V — and reads back the bit `modifiers()` must
-/// set for Control under *this* keymap.
-fn compile_keymap() -> anyhow::Result<(String, u32)> {
+/// naming only Control and V — and reads back the bits `modifiers()`
+/// must set for Control and Shift under *this* keymap.
+fn compile_keymap() -> anyhow::Result<(String, u32, u32)> {
     let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
     let keymap = xkb::Keymap::new_from_names(
         &context,
@@ -275,10 +325,15 @@ fn compile_keymap() -> anyhow::Result<(String, u32)> {
     if ctrl_index == xkb::MOD_INVALID {
         anyhow::bail!("compiled keymap has no Control modifier");
     }
+    let shift_index = keymap.mod_get_index(xkb::MOD_NAME_SHIFT);
+    if shift_index == xkb::MOD_INVALID {
+        anyhow::bail!("compiled keymap has no Shift modifier");
+    }
 
     Ok((
         keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1),
         1u32 << ctrl_index,
+        1u32 << shift_index,
     ))
 }
 
@@ -310,13 +365,82 @@ mod tests {
     /// compositor: compiling a keymap is a pure libxkbcommon operation.
     #[test]
     fn the_control_bit_is_read_back_from_the_compiled_keymap_not_assumed() {
-        let (text, ctrl_bit) = compile_keymap().expect("the system's \"us\" keymap must compile");
+        let (text, ctrl_bit, shift_bit) = compile_keymap().expect("the system's \"us\" keymap must compile");
         assert!(!text.is_empty());
         assert!(text.contains("xkb_keymap"));
         assert_ne!(ctrl_bit, 0, "Control must resolve to some non-zero bit");
+        assert_ne!(shift_bit, 0, "Shift must resolve to some non-zero bit");
+        assert_ne!(ctrl_bit, shift_bit, "Control and Shift must not resolve to the same bit");
         // Confirms the keymap actually contains a Control key and a V
         // key (via its symbol) rather than an unrelated "us" variant
         // that dropped one — the two keys this crate presses.
         assert!(text.to_lowercase().contains("control"));
+    }
+
+    // --- `combo_requests`: the pure sequence `Inner::send_combo` plays
+    // back onto the real protocol requests. No `Connection`, no proxy, no
+    // compositor — exactly the seam CLAUDE.md asks a D-Bus-backed
+    // module's decisions to have, applied here to a Wayland one.
+
+    const CTRL_BIT: u32 = 0b0100;
+    const SHIFT_BIT: u32 = 0b0001;
+
+    /// Every press has a matching release, for both keys a Ctrl+Shift+V
+    /// sends — the property a stuck Ctrl or Shift on someone's real
+    /// keyboard would violate.
+    #[test]
+    fn every_pressed_key_is_released_for_ctrl_shift_v() {
+        let requests = combo_requests(Shortcut::CtrlShiftV, CTRL_BIT, SHIFT_BIT);
+        for key in [KEY_LEFTCTRL, KEY_LEFTSHIFT, KEY_V] {
+            let presses = requests.iter().filter(|r| **r == Request::Key(key, KEY_STATE_PRESSED)).count();
+            let releases = requests.iter().filter(|r| **r == Request::Key(key, KEY_STATE_RELEASED)).count();
+            assert_eq!(presses, 1, "key {key} must be pressed exactly once");
+            assert_eq!(releases, 1, "key {key} must be released exactly once");
+        }
+    }
+
+    /// Plain Ctrl+V never touches Shift at all — no press, no release,
+    /// not even a bit set in `modifiers()` for it.
+    #[test]
+    fn ctrl_v_never_presses_or_bit_sets_shift() {
+        let requests = combo_requests(Shortcut::CtrlV, CTRL_BIT, SHIFT_BIT);
+        assert!(!requests.contains(&Request::Key(KEY_LEFTSHIFT, KEY_STATE_PRESSED)));
+        assert!(!requests.contains(&Request::Key(KEY_LEFTSHIFT, KEY_STATE_RELEASED)));
+        for request in &requests {
+            if let Request::Modifiers(mods) = request {
+                assert_eq!(mods & SHIFT_BIT, 0, "Shift's bit must never be set for plain Ctrl+V");
+            }
+        }
+    }
+
+    /// The modifier state is set *before* any key press and cleared
+    /// *unconditionally* as the very last request — both combinations,
+    /// so nothing here can leave Ctrl or Shift depressed.
+    #[test]
+    fn modifiers_are_set_first_and_cleared_last_for_both_shortcuts() {
+        for shortcut in [Shortcut::CtrlV, Shortcut::CtrlShiftV] {
+            let requests = combo_requests(shortcut, CTRL_BIT, SHIFT_BIT);
+            let first = requests.first().copied().unwrap();
+            let last = requests.last().copied().unwrap();
+            assert!(matches!(first, Request::Modifiers(mods) if mods != 0), "{shortcut:?}: first request must set modifiers");
+            assert_eq!(last, Request::Modifiers(0), "{shortcut:?}: last request must clear every modifier");
+            // Every request in between is a key, never another
+            // modifiers request that could leave a window where a press
+            // reached the compositor without the right modifier bits
+            // already held.
+            for middle in &requests[1..requests.len() - 1] {
+                assert!(matches!(middle, Request::Key(_, _)));
+            }
+        }
+    }
+
+    /// Ctrl+Shift+V's `modifiers` bit set actually carries both bits —
+    /// not just Ctrl with Shift forgotten, which would send a keystroke
+    /// no terminal recognises as paste at all.
+    #[test]
+    fn ctrl_shift_v_sets_both_bits_in_the_same_modifiers_request() {
+        let requests = combo_requests(Shortcut::CtrlShiftV, CTRL_BIT, SHIFT_BIT);
+        let Request::Modifiers(mods) = requests[0] else { panic!("expected a Modifiers request first") };
+        assert_eq!(mods, CTRL_BIT | SHIFT_BIT);
     }
 }

@@ -1,5 +1,6 @@
-//! `hyprforge-clipd`: watches the compositor's clipboard and records what
-//! is worth keeping.
+//! `hyprforge-clipd`: watches the compositor's clipboard, records what
+//! is worth keeping, and — since this daemon took over `set-clipboard`
+//! — is also the thing that keeps a chosen entry pasteable.
 //!
 //! # This daemon is still the only writer — now other processes can ask
 //!
@@ -24,6 +25,31 @@
 //! channel is exactly what this module doc used to say would have to
 //! exist before the popup could ask for a pin or a remove at all.
 //!
+//! # This daemon is now also the only thing holding the selection open
+//!
+//! On Wayland the clipboard selection is served by whichever client set
+//! it — the compositor asks *that process* for the bytes on every
+//! paste. `hyprforge-clipmenu` is a popup: it appears, the user chooses
+//! an entry, and it exits. Setting the selection from the popup and then
+//! exiting destroys the very thing serving it, so the clipboard reads as
+//! empty the moment the popup is gone — worse than before an entry was
+//! chosen, because now there is nothing to paste at all where there used
+//! to be whatever was on the clipboard before. `ipc::Request::SetClipboard`
+//! is this daemon's answer: it looks the entry up in the history it
+//! already holds, calls [`hyprforge_clipboard::ClipboardWriter::set_selection`]
+//! itself, and keeps the returned guard in [`ipc::Shared::selection`] for
+//! as long as this process runs, replacing (and thereby dropping) the
+//! previous one on every new `set-clipboard`. What this buys: an entry,
+//! once chosen, stays pasteable — over and over, from any window — for
+//! as long as `hyprforge-clipd` is running, with no popup involved after
+//! the choice is made. What it costs: the clipboard is now only as
+//! durable as this daemon. If it is killed or crashes, the selection
+//! goes with it, exactly as it always has for every other Wayland
+//! clipboard manager — there is no way around that on this protocol, only
+//! a choice of *which* long-lived process holds it, and this daemon is
+//! the one already guaranteed to be running for as long as the history
+//! it serves is meaningful at all.
+//!
 //! # Protocol
 //!
 //! One JSON object per line over the socket, request → response,
@@ -35,6 +61,7 @@
 //! | `{"cmd":"pin","id":"<entry id>"}`       | `{"ok":true}`                 |
 //! | `{"cmd":"unpin","id":"<entry id>"}`     | `{"ok":true}`                 |
 //! | `{"cmd":"remove","id":"<entry id>"}`    | `{"ok":true}`                 |
+//! | `{"cmd":"set-clipboard","id":"<entry id>"}` | `{"ok":true}`             |
 //! | `{"cmd":"list"}`                        | `{"ok":true,"entries":[…]}`   |
 //! | `{"cmd":"status"}`                      | `{"ok":true,"status":{…}}`    |
 //! | unknown / malformed                     | `{"ok":false,"error":"…"}`    |
@@ -56,7 +83,7 @@
 
 use hyprforge_clipboard::ipc::Shared;
 use hyprforge_clipboard::{
-    ClipboardWatcher, Entry, History, Recordable, Sensitivity, WaylandWatcher,
+    ClipboardWatcher, Entry, History, Recordable, Sensitivity, WaylandWatcher, WaylandWriter,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -104,9 +131,14 @@ async fn main() -> anyhow::Result<()> {
     // One `History` behind one lock, shared between the watcher loop
     // below and every control-socket connection in `ipc.rs` — see this
     // module's doc on why that lock is what keeps this the only writer.
+    // `selection` is a *separate* lock (see `ipc::Shared`'s doc) holding
+    // the guard from this daemon's own most recent `set-clipboard` — kept
+    // alive for as long as this process runs, which is the entire point.
     let shared = Arc::new(Shared {
         history: tokio::sync::Mutex::new(history),
         can_save,
+        writer: WaylandWriter::new(),
+        selection: tokio::sync::Mutex::new(None),
     });
 
     let ipc_shared = Arc::clone(&shared);
@@ -143,7 +175,7 @@ async fn main() -> anyhow::Result<()> {
 /// Drains the watcher's channel until it closes (the dispatch thread on
 /// the other end died — see `wayland::ext`/`wayland::wlr`'s `Finished`
 /// handling), recording each entry as it arrives.
-async fn run_until_disconnected(watcher: &WaylandWatcher, shared: &Shared) {
+async fn run_until_disconnected(watcher: &WaylandWatcher, shared: &Shared<WaylandWriter>) {
     let mut entries = watcher.subscribe();
     while let Some(entry) = entries.recv().await {
         // Never log the content — only its id (a content hash, not the

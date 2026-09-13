@@ -26,9 +26,35 @@
 //! | `{"cmd":"pin","id":"<entry id>"}`           | `{"ok":true}`                                |
 //! | `{"cmd":"unpin","id":"<entry id>"}`         | `{"ok":true}`                                |
 //! | `{"cmd":"remove","id":"<entry id>"}`        | `{"ok":true}`                                |
+//! | `{"cmd":"set-clipboard","id":"<entry id>"}` | `{"ok":true}`                                |
 //! | `{"cmd":"list"}`                            | `{"ok":true,"entries":[…]}`                  |
 //! | `{"cmd":"status"}`                          | `{"ok":true,"status":{…}}`                   |
 //! | unknown / malformed                         | `{"ok":false,"error":"…"}`                   |
+//!
+//! # `set-clipboard`: the daemon becomes the selection's owner
+//!
+//! `pin`/`unpin`/`remove` change what is *recorded*; `set-clipboard` puts
+//! an already-recorded entry's content back on the compositor's
+//! clipboard, with this daemon as the source that serves it. On Wayland
+//! the selection is served by whichever client set it — see
+//! `bin/clipd.rs`'s `SharedHistory` doc for the "the source has to stay
+//! alive" rule `write.rs` documents on `ClipboardWriter::set_selection`
+//! — so a popup that sets the selection and then exits loses the
+//! content the moment it does. `hyprforge-clipd` is already resident for
+//! as long as anyone can paste, so it — not the short-lived popup — is
+//! the thing that should hold the source open: see [`Shared::selection`]
+//! for how the guard from `set_selection` is kept, and this module's
+//! `handle_line` for where the swap happens.
+//!
+//! `set-clipboard` does **not** touch `can_save` or call
+//! [`History::save`] at all: it reads an already-loaded entry out of
+//! memory and hands its content to the compositor. Nothing about it
+//! writes the index file, so refusing it when `can_save` is `false`
+//! would withhold a feature (repeat-paste) that has nothing to do with
+//! the thing that actually failed (parsing the on-disk file). The two
+//! stay independent: a broken history file still blocks *saving*
+//! mutations, but it never blocks reading an entry that already made it
+//! into memory and putting it back on the clipboard.
 //!
 //! The connection stays open after a response; a client may send
 //! multiple requests before closing. Malformed requests do **not** close
@@ -73,7 +99,8 @@
 //! silent client cannot block another, or the clipboard watcher loop.
 
 use crate::store::History;
-use crate::types::EntryId;
+use crate::types::{Content, EntryId};
+use crate::write::ClipboardWriter;
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -122,6 +149,11 @@ pub enum Request {
     Unpin { id: String },
     /// Delete an entry outright.
     Remove { id: String },
+    /// Put an already-recorded entry's content back on the clipboard,
+    /// with this daemon as the source that serves it — see the module
+    /// doc's "`set-clipboard`: the daemon becomes the selection's
+    /// owner".
+    SetClipboard { id: String },
     /// The full history, in display order.
     List,
     /// Whether this daemon is alive, and how healthy its history is.
@@ -217,20 +249,42 @@ fn err(message: impl Into<String>) -> Response {
 /// `list` and `status` are unaffected: reading in-memory state is always
 /// safe, and `status` is how a client learns `can_save` is `false` in
 /// the first place.
-pub fn handle_line(history: &mut History, can_save: bool, line: &str) -> (String, bool) {
+/// `writer` and `selection` only matter for [`Request::SetClipboard`] —
+/// every other request ignores them. The real server (`handle_connection`
+/// below) does **not** call this for `set-clipboard`: it needs to release
+/// the history lock before making the (unbounded) Wayland round trip
+/// `writer.set_selection` makes, and this function holds `history` for
+/// its whole body. This is still the entry point the tests use, with
+/// [`crate::write::mock::MockWriter`] standing in for a real writer —
+/// the mock never blocks, so calling it from here is exactly as pure as
+/// every other request already is.
+pub fn handle_line<W: ClipboardWriter>(
+    history: &mut History,
+    can_save: bool,
+    writer: &W,
+    selection: &mut Option<W::Guard>,
+    line: &str,
+) -> (String, bool) {
     let request: Result<Request, _> = serde_json::from_str(line);
     let (response, mutated) = match request {
         Err(e) => (err(format!("malformed request: {e}")), false),
-        Ok(request) => dispatch(history, can_save, request),
+        Ok(request) => dispatch(history, can_save, writer, selection, request),
     };
     (to_json(&response), mutated)
 }
 
-fn dispatch(history: &mut History, can_save: bool, request: Request) -> (Response, bool) {
+fn dispatch<W: ClipboardWriter>(
+    history: &mut History,
+    can_save: bool,
+    writer: &W,
+    selection: &mut Option<W::Guard>,
+    request: Request,
+) -> (Response, bool) {
     match request {
         Request::Pin { id } => apply_pin(history, can_save, id, true),
         Request::Unpin { id } => apply_pin(history, can_save, id, false),
         Request::Remove { id } => remove(history, can_save, id),
+        Request::SetClipboard { id } => apply_set_clipboard(history, writer, selection, id),
         Request::List => (
             Response::Entries {
                 ok: true,
@@ -249,6 +303,65 @@ fn dispatch(history: &mut History, can_save: bool, request: Request) -> (Respons
             },
             false,
         ),
+    }
+}
+
+/// Looks `id` up in `history` and returns its content, or the response to
+/// send back when no entry has that id. No I/O, and no `writer` involved
+/// — shared by [`apply_set_clipboard`] below and by the real server's own
+/// two-phase path (`set_clipboard_on_daemon`), so both agree on exactly
+/// what "no such id" reports.
+fn find_content(history: &History, id: &str) -> Result<Content, Response> {
+    let entry_id = EntryId::from_raw(id);
+    history
+        .entries()
+        .iter()
+        .find(|e| e.id == entry_id)
+        .map(|e| e.content.clone())
+        .ok_or_else(|| err(format!("no clipboard entry with id {id}")))
+}
+
+/// `set-clipboard`: puts `id`'s content on the clipboard through
+/// `writer`, replacing `*selection` with the new guard.
+///
+/// Deliberately **not** gated on `can_save`, unlike `apply_pin`/`remove`.
+/// Those refuse when the on-disk history could not be parsed because
+/// applying them anyway would only ever be kept in memory, never saved —
+/// see `unsavable_message`. This request never calls [`History::save`]
+/// at all: it reads an entry already sitting in memory and hands its
+/// content to the compositor, so whether the *index file* parsed has no
+/// bearing on whether that read-and-serve can happen. Gating this on
+/// `can_save` would withhold "paste this again" — which has nothing to
+/// do with the file on disk — for exactly the situation (a history that
+/// failed to load) where the user most needs the entries that *did* make
+/// it into memory to still be usable.
+///
+/// Replacing `*selection` drops whatever guard was there before it is
+/// overwritten (a `Mutex<Option<T>>` assignment runs the old `Option`'s
+/// `Drop` before storing the new one) — which drops that source and lets
+/// its dispatch thread end, per `write.rs`'s `ClipboardWriter::set_selection`
+/// doc. Exactly one guard is ever held at a time.
+///
+/// Never itself a `History` mutation (`mutated` is always `false`): the
+/// caller must never call `History::save` for this request.
+fn apply_set_clipboard<W: ClipboardWriter>(
+    history: &History,
+    writer: &W,
+    selection: &mut Option<W::Guard>,
+    id: String,
+) -> (Response, bool) {
+    match find_content(history, &id) {
+        Err(response) => (response, false),
+        Ok(content) => match writer.set_selection(content) {
+            Ok(guard) => {
+                *selection = Some(guard);
+                (Response::Ok, false)
+            }
+            // Never the content — `e` is a connection/protocol error
+            // from `ClipboardWriter::set_selection`, never anything
+            // derived from what was copied.
+            Err(e) => (err(format!("failed to set the clipboard: {e}")), false),
+        },
     }
 }
 
@@ -432,30 +545,81 @@ pub fn set_pinned_at(path: &Path, id: &str, pinned: bool, timeout: Duration) -> 
     request_at(path, &request, timeout)
 }
 
+/// Asks `hyprforge-clipd` at the default socket path to put entry `id`
+/// back on the clipboard, with the daemon itself holding the selection
+/// open afterward — see this module's doc on why that is the whole
+/// point of routing this through the daemon rather than setting the
+/// selection from the caller's own process.
+///
+/// `hyprforge-clipmenu` is not required to use this: nothing about
+/// [`crate::ClipboardWriter`]/[`crate::SelectionGuard`] goes away.
+/// [`ClientError::Unreachable`] coming back means there was nobody to
+/// ask (the daemon is not running) rather than that the request was
+/// refused — CLAUDE.md's "every component runs alone" — so a caller can
+/// treat it as the signal to fall back to setting the selection itself
+/// (and waiting on the guard, the way `hyprforge-clipmenu`'s chooser
+/// does today) instead of treating a missing daemon as an outright
+/// failure to paste.
+pub fn set_clipboard(id: &str) -> Result<(), ClientError> {
+    let path = socket_path().map_err(|_| ClientError::NoRuntimeDir)?;
+    set_clipboard_at(&path, id, CLIENT_TIMEOUT)
+}
+
+/// [`set_clipboard`] against an explicit socket `path` and `timeout` —
+/// the seam the tests below use to talk to a throwaway daemon instead of
+/// `$XDG_RUNTIME_DIR`'s real one.
+pub fn set_clipboard_at(path: &Path, id: &str, timeout: Duration) -> Result<(), ClientError> {
+    request_at(path, &Request::SetClipboard { id: id.to_string() }, timeout)
+}
+
 // ── The socket layer ────────────────────────────────────────────────────
 
 /// State shared between the clipboard watcher loop and every IPC
 /// connection: one [`History`] behind one lock, so a pin request and an
 /// incoming copy can never interleave into two half-applied writes. See
 /// `bin/clipd.rs`.
-pub struct Shared {
+///
+/// `writer` and `selection` are the new half, for `set-clipboard`:
+/// `writer` is what actually talks to the compositor, and `selection`
+/// holds the guard from this daemon's own most recent successful
+/// `set_selection` call — kept alive for as long as this process runs,
+/// which is the entire reason `set-clipboard` exists (see the module
+/// doc). It is a lock **separate** from `history`'s: a `set-clipboard`
+/// request only needs `history` briefly, to read an entry's content (see
+/// `set_clipboard_on_daemon`), and must never hold it across the actual
+/// (unbounded) Wayland round trip `writer.set_selection` makes — that
+/// would stall the watcher loop's own `history.lock().await` for as long
+/// as the compositor takes to answer, which per CLAUDE.md is a thing
+/// nothing here may wait on without a bound.
+pub struct Shared<W: ClipboardWriter> {
     pub history: Mutex<History>,
     /// Set once at startup from whether the on-disk file parsed; never
     /// flipped at runtime — see `clipd.rs`'s module doc on why fixing it
     /// requires a restart rather than a live retry.
     pub can_save: bool,
+    pub writer: W,
+    pub selection: Mutex<Option<W::Guard>>,
 }
 
 /// Runs the control socket at `$XDG_RUNTIME_DIR/clipd.sock` until the
 /// process exits. Removes a stale socket file before binding and removes
 /// its own socket file again on return.
-pub async fn run(shared: Arc<Shared>) -> Result<(), IpcError> {
+pub async fn run<W: ClipboardWriter + 'static>(shared: Arc<Shared<W>>) -> Result<(), IpcError>
+where
+    W::Guard: 'static,
+{
     run_at(&socket_path()?, shared).await
 }
 
 /// Runs the control socket at an explicit `path` — the seam tests use to
 /// avoid `$XDG_RUNTIME_DIR` and the real socket entirely.
-pub async fn run_at(path: &Path, shared: Arc<Shared>) -> Result<(), IpcError> {
+pub async fn run_at<W: ClipboardWriter + 'static>(
+    path: &Path,
+    shared: Arc<Shared<W>>,
+) -> Result<(), IpcError>
+where
+    W::Guard: 'static,
+{
     /// Removes the socket file when dropped, on a clean return or a
     /// cancelled task alike — the same reasoning as `notif-ipc`'s
     /// `SocketGuard`.
@@ -480,7 +644,7 @@ pub async fn run_at(path: &Path, shared: Arc<Shared>) -> Result<(), IpcError> {
             Ok((stream, _addr)) => {
                 let shared = Arc::clone(&shared);
                 tokio::spawn(async move {
-                    handle_connection(stream, &shared).await;
+                    handle_connection(stream, shared).await;
                 });
             }
             Err(e) => {
@@ -490,7 +654,10 @@ pub async fn run_at(path: &Path, shared: Arc<Shared>) -> Result<(), IpcError> {
     }
 }
 
-async fn handle_connection(stream: UnixStream, shared: &Shared) {
+async fn handle_connection<W: ClipboardWriter + 'static>(stream: UnixStream, shared: Arc<Shared<W>>)
+where
+    W::Guard: 'static,
+{
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
@@ -514,9 +681,42 @@ async fn handle_connection(stream: UnixStream, shared: &Shared) {
             continue;
         }
 
-        let response_json = {
+        let response_json = process_line(&shared, trimmed).await;
+
+        if writer
+            .write_all(format!("{response_json}\n").as_bytes())
+            .await
+            .is_err()
+        {
+            return; // client gone
+        }
+    }
+}
+
+/// Parses one request line and answers it, routing `set-clipboard` to
+/// [`set_clipboard_on_daemon`] (never through the same lock scope as the
+/// other requests — see [`Shared`]'s doc) and everything else through
+/// the same [`dispatch`]/[`History::save`] pattern this socket has always
+/// used.
+async fn process_line<W: ClipboardWriter + 'static>(shared: &Arc<Shared<W>>, line: &str) -> String
+where
+    W::Guard: 'static,
+{
+    match serde_json::from_str::<Request>(line) {
+        Err(e) => to_json(&err(format!("malformed request: {e}"))),
+        Ok(Request::SetClipboard { id }) => {
+            to_json(&set_clipboard_on_daemon(Arc::clone(shared), id).await)
+        }
+        Ok(request) => {
             let mut history = shared.history.lock().await;
-            let (response_json, mutated) = handle_line(&mut history, shared.can_save, trimmed);
+            let mut no_writer_needed = None; // none of these variants touch `writer`/`selection`
+            let (response, mutated) = dispatch(
+                &mut history,
+                shared.can_save,
+                &shared.writer,
+                &mut no_writer_needed,
+                request,
+            );
             if mutated {
                 // Still the only writer: this is the same `History::save`
                 // `clipd.rs`'s watcher loop calls, taken under the same
@@ -525,15 +725,59 @@ async fn handle_connection(stream: UnixStream, shared: &Shared) {
                     tracing::error!(error = %e, "failed to save clipboard history after a control request");
                 }
             }
-            response_json
-        };
+            to_json(&response)
+        }
+    }
+}
 
-        if writer
-            .write_all(format!("{response_json}\n").as_bytes())
-            .await
-            .is_err()
-        {
-            return; // client gone
+/// The real, async two-phase `set-clipboard`: reads the entry's content
+/// with `shared.history` locked only long enough to clone it, then makes
+/// the actual (unbounded) Wayland round trip on a blocking thread with
+/// *no* lock held at all, and finally stores the resulting guard under
+/// `shared.selection`'s own lock — never `shared.history`'s. This is the
+/// shape [`Shared`]'s doc promises: the watcher loop's own
+/// `history.lock().await` is never made to wait on the compositor
+/// answering a `set-clipboard` request.
+async fn set_clipboard_on_daemon<W: ClipboardWriter + 'static>(
+    shared: Arc<Shared<W>>,
+    id: String,
+) -> Response
+where
+    W::Guard: 'static,
+{
+    let content = {
+        let history = shared.history.lock().await;
+        match find_content(&history, &id) {
+            Ok(content) => content,
+            Err(response) => return response,
+        }
+    };
+    // `history`'s lock is dropped here, before the compositor round trip
+    // below — see this function's doc.
+
+    let blocking_shared = Arc::clone(&shared);
+    let result = tokio::task::spawn_blocking(move || blocking_shared.writer.set_selection(content))
+        .await;
+
+    match result {
+        Ok(Ok(guard)) => {
+            // Assigning over `*selection` drops whatever guard was there
+            // before the new value is stored — dropping the old source
+            // and letting its dispatch thread end. Exactly one guard is
+            // ever held at a time; see `apply_set_clipboard`'s doc for
+            // the same point on the test-only synchronous path.
+            let mut selection = shared.selection.lock().await;
+            *selection = Some(guard);
+            Response::Ok
+        }
+        Ok(Err(e)) => err(format!("failed to set the clipboard: {e}")),
+        Err(_join_error) => {
+            // The blocking task panicked — this daemon must keep running
+            // regardless (see `bin/clipd.rs`'s "fatal only for the
+            // socket" reasoning for the control task as a whole), so this
+            // is reported to the one caller who asked rather than taken
+            // as a reason to do anything more drastic.
+            err("internal error setting the clipboard".to_string())
         }
     }
 }
@@ -554,11 +798,33 @@ mod tests {
         (history, id)
     }
 
+    /// [`handle_line`] with a throwaway [`crate::write::mock::MockWriter`]
+    /// and no selection state — what every test that only cares about
+    /// `pin`/`unpin`/`remove`/`list`/`status` uses, so those tests read
+    /// exactly as they did before `set-clipboard` existed.
+    fn handle_line_test(history: &mut History, can_save: bool, line: &str) -> (String, bool) {
+        let writer = crate::write::mock::MockWriter::new();
+        let mut selection = None;
+        handle_line(history, can_save, &writer, &mut selection, line)
+    }
+
+    /// A [`Shared`] over [`crate::write::mock::MockWriter`], for the
+    /// real-socket tests below — never a real compositor, and never
+    /// `$XDG_RUNTIME_DIR`.
+    fn test_shared(history: History, can_save: bool) -> Arc<Shared<crate::write::mock::MockWriter>> {
+        Arc::new(Shared {
+            history: Mutex::new(history),
+            can_save,
+            writer: crate::write::mock::MockWriter::new(),
+            selection: Mutex::new(None),
+        })
+    }
+
     #[test]
     fn ok_response_is_exactly_ok_true_with_no_other_fields() {
         let (mut history, id) = history_with_one_entry();
         let line = format!(r#"{{"cmd":"pin","id":"{}"}}"#, id.as_str());
-        let (response, mutated) = handle_line(&mut history, true, &line);
+        let (response, mutated) = handle_line_test(&mut history, true, &line);
         assert_eq!(response, r#"{"ok":true}"#);
         assert!(mutated);
     }
@@ -567,7 +833,7 @@ mod tests {
     fn pin_happy_path_sets_pinned_and_reports_mutated() {
         let (mut history, id) = history_with_one_entry();
         let line = format!(r#"{{"cmd":"pin","id":"{}"}}"#, id.as_str());
-        let (_response, mutated) = handle_line(&mut history, true, &line);
+        let (_response, mutated) = handle_line_test(&mut history, true, &line);
         assert!(mutated);
         assert!(history.entries()[0].pinned);
     }
@@ -577,7 +843,7 @@ mod tests {
         let (mut history, id) = history_with_one_entry();
         history.set_pinned(&id, true);
         let line = format!(r#"{{"cmd":"unpin","id":"{}"}}"#, id.as_str());
-        let (_response, mutated) = handle_line(&mut history, true, &line);
+        let (_response, mutated) = handle_line_test(&mut history, true, &line);
         assert!(mutated);
         assert!(!history.entries()[0].pinned);
     }
@@ -586,7 +852,7 @@ mod tests {
     fn remove_happy_path_deletes_the_entry_and_reports_mutated() {
         let (mut history, id) = history_with_one_entry();
         let line = format!(r#"{{"cmd":"remove","id":"{}"}}"#, id.as_str());
-        let (_response, mutated) = handle_line(&mut history, true, &line);
+        let (_response, mutated) = handle_line_test(&mut history, true, &line);
         assert!(mutated);
         assert!(history.entries().is_empty());
     }
@@ -594,7 +860,7 @@ mod tests {
     #[test]
     fn list_returns_every_entry_without_leaking_raw_content_fields() {
         let (mut history, id) = history_with_one_entry();
-        let (response, mutated) = handle_line(&mut history, true, r#"{"cmd":"list"}"#);
+        let (response, mutated) = handle_line_test(&mut history, true, r#"{"cmd":"list"}"#);
         assert!(!mutated, "reading history is never itself a mutation");
         let value: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(value["ok"], true);
@@ -620,7 +886,7 @@ mod tests {
     #[test]
     fn status_reports_counts_and_whether_saving_is_possible() {
         let (mut history, _id) = history_with_one_entry();
-        let (response, mutated) = handle_line(&mut history, false, r#"{"cmd":"status"}"#);
+        let (response, mutated) = handle_line_test(&mut history, false, r#"{"cmd":"status"}"#);
         assert!(!mutated);
         let value: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(value["ok"], true);
@@ -631,7 +897,7 @@ mod tests {
     #[test]
     fn an_unknown_command_is_an_error_not_a_closed_connection() {
         let mut history = History::new();
-        let (response, mutated) = handle_line(&mut history, true, r#"{"cmd":"frobnicate"}"#);
+        let (response, mutated) = handle_line_test(&mut history, true, r#"{"cmd":"frobnicate"}"#);
         assert!(!mutated);
         let value: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(value["ok"], false);
@@ -641,7 +907,7 @@ mod tests {
     #[test]
     fn malformed_json_is_an_error_not_a_panic() {
         let mut history = History::new();
-        let (response, mutated) = handle_line(&mut history, true, "not json at all { { {");
+        let (response, mutated) = handle_line_test(&mut history, true, "not json at all { { {");
         assert!(!mutated);
         let value: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(value["ok"], false);
@@ -651,7 +917,7 @@ mod tests {
     fn an_id_that_does_not_exist_is_an_error_and_never_mutates() {
         let (mut history, _id) = history_with_one_entry();
         let (response, mutated) =
-            handle_line(&mut history, true, r#"{"cmd":"pin","id":"not-a-real-id"}"#);
+            handle_line_test(&mut history, true, r#"{"cmd":"pin","id":"not-a-real-id"}"#);
         assert!(!mutated);
         let value: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(value["ok"], false);
@@ -667,7 +933,7 @@ mod tests {
         let (mut history, id) = history_with_one_entry();
         let before = history.entries()[0].pinned;
         let line = format!(r#"{{"cmd":"pin","id":"{}"}}"#, id.as_str());
-        let (response, mutated) = handle_line(&mut history, false, &line);
+        let (response, mutated) = handle_line_test(&mut history, false, &line);
         assert!(
             !mutated,
             "a request must not be applied in memory when it can never be saved"
@@ -685,7 +951,7 @@ mod tests {
     fn remove_is_refused_without_mutating_when_the_history_could_not_be_saved() {
         let (mut history, id) = history_with_one_entry();
         let line = format!(r#"{{"cmd":"remove","id":"{}"}}"#, id.as_str());
-        let (response, mutated) = handle_line(&mut history, false, &line);
+        let (response, mutated) = handle_line_test(&mut history, false, &line);
         assert!(!mutated);
         assert_eq!(history.entries().len(), 1, "entry must still be present");
         let value: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -695,7 +961,7 @@ mod tests {
     #[test]
     fn list_and_status_still_work_when_the_history_could_not_be_saved() {
         let (mut history, _id) = history_with_one_entry();
-        let (response, _) = handle_line(&mut history, false, r#"{"cmd":"list"}"#);
+        let (response, _) = handle_line_test(&mut history, false, r#"{"cmd":"list"}"#);
         let value: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(value["ok"], true, "reading must not be blocked by can_save");
     }
@@ -711,10 +977,7 @@ mod tests {
         std::fs::write(&path, b"not a socket").unwrap(); // simulate staleness
 
         let (history, id) = history_with_one_entry();
-        let shared = Arc::new(Shared {
-            history: Mutex::new(history),
-            can_save: true,
-        });
+        let shared = test_shared(history, true);
 
         let serve_path = path.clone();
         let serve_shared = Arc::clone(&shared);
@@ -759,7 +1022,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("clipd-client-test.sock");
         let (history, id) = history_with_one_entry();
-        let shared = Arc::new(Shared { history: Mutex::new(history), can_save: true });
+        let shared = test_shared(history, true);
 
         let serve_path = path.clone();
         let serve_shared = Arc::clone(&shared);
@@ -843,7 +1106,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("clipd-refuse-test.sock");
         let (history, id) = history_with_one_entry();
-        let shared = Arc::new(Shared { history: Mutex::new(history), can_save: false });
+        let shared = test_shared(history, false);
 
         let serve_path = path.clone();
         let serve_shared = Arc::clone(&shared);
@@ -866,6 +1129,296 @@ mod tests {
             }
             other => panic!("expected a Refused error, got {other:?}"),
         }
+
+        server.abort();
+    }
+
+    // ── set-clipboard ────────────────────────────────────────────────
+
+    /// The happy path: an existing entry's content reaches the writer,
+    /// and the resulting guard is kept in `selection` — this is the
+    /// property Part 2 of the task exists for. `MockWriter` never
+    /// touches a real compositor.
+    #[test]
+    fn set_clipboard_happy_path_hands_the_entrys_content_to_the_writer_and_keeps_the_guard() {
+        let (mut history, id) = history_with_one_entry();
+        let writer = crate::write::mock::MockWriter::new();
+        let mut selection = None;
+        let line = format!(r#"{{"cmd":"set-clipboard","id":"{}"}}"#, id.as_str());
+
+        let (response, mutated) = handle_line(&mut history, true, &writer, &mut selection, &line);
+
+        assert_eq!(response, r#"{"ok":true}"#);
+        assert!(
+            !mutated,
+            "set-clipboard never writes the index file, so it must never ask the caller to save"
+        );
+        assert_eq!(writer.calls(), vec![Content::Text("hello".into())]);
+        assert!(
+            selection.is_some(),
+            "the guard from set_selection must be kept, not dropped"
+        );
+    }
+
+    /// Replacing an old guard must drop it — otherwise a source (and its
+    /// dispatch thread) from a previous `set-clipboard` would outlive its
+    /// usefulness. `MockGuard` carries no observable drop signal on its
+    /// own, so this pins the behaviour through `Option::replace`'s
+    /// documented semantics instead: assigning `*selection = Some(..)`
+    /// again must still leave exactly one guard held, never two.
+    #[test]
+    fn setting_the_clipboard_a_second_time_replaces_rather_than_accumulates_the_guard() {
+        let mut history = History::new();
+        history.record(
+            Recordable::new(Content::Text("first".into()), Sensitivity::Recordable).unwrap(),
+            1,
+        );
+        history.record(
+            Recordable::new(Content::Text("second".into()), Sensitivity::Recordable).unwrap(),
+            2,
+        );
+        let first_id = history
+            .entries()
+            .iter()
+            .find(|e| e.content == Content::Text("first".into()))
+            .unwrap()
+            .id
+            .clone();
+        let second_id = history
+            .entries()
+            .iter()
+            .find(|e| e.content == Content::Text("second".into()))
+            .unwrap()
+            .id
+            .clone();
+
+        let writer = crate::write::mock::MockWriter::new();
+        let mut selection = None;
+
+        let line_one = format!(r#"{{"cmd":"set-clipboard","id":"{}"}}"#, first_id.as_str());
+        handle_line(&mut history, true, &writer, &mut selection, &line_one);
+        assert!(selection.is_some());
+
+        let line_two = format!(r#"{{"cmd":"set-clipboard","id":"{}"}}"#, second_id.as_str());
+        handle_line(&mut history, true, &writer, &mut selection, &line_two);
+
+        // Still exactly one guard — the assignment in `apply_set_clipboard`
+        // replaced (and thereby dropped) the first rather than being
+        // additive.
+        assert!(selection.is_some());
+        assert_eq!(
+            writer.calls(),
+            vec![Content::Text("first".into()), Content::Text("second".into())]
+        );
+    }
+
+    /// An id that names no entry is refused, exactly like `pin`/`remove`
+    /// — and, crucially, nothing is ever handed to the writer for it.
+    #[test]
+    fn set_clipboard_with_an_unknown_id_is_refused_and_never_touches_the_writer() {
+        let (mut history, _id) = history_with_one_entry();
+        let writer = crate::write::mock::MockWriter::new();
+        let mut selection = None;
+
+        let (response, mutated) = handle_line(
+            &mut history,
+            true,
+            &writer,
+            &mut selection,
+            r#"{"cmd":"set-clipboard","id":"not-a-real-id"}"#,
+        );
+
+        assert!(!mutated);
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["ok"], false);
+        assert!(value["error"].as_str().unwrap().contains("not-a-real-id"));
+        assert!(writer.calls().is_empty());
+        assert!(selection.is_none());
+    }
+
+    /// The property the module doc's "`set-clipboard` does not touch
+    /// `can_save`" section exists to pin: unlike `pin`/`unpin`/`remove`,
+    /// this request succeeds even when the on-disk history could not be
+    /// parsed, because it never calls `History::save` — it only reads an
+    /// entry already in memory and hands it to the writer.
+    #[test]
+    fn set_clipboard_works_even_when_the_history_could_not_be_saved() {
+        let (mut history, id) = history_with_one_entry();
+        let writer = crate::write::mock::MockWriter::new();
+        let mut selection = None;
+        let line = format!(r#"{{"cmd":"set-clipboard","id":"{}"}}"#, id.as_str());
+
+        let (response, mutated) =
+            handle_line(&mut history, /* can_save */ false, &writer, &mut selection, &line);
+
+        assert!(!mutated);
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            value["ok"], true,
+            "a broken index file must not block putting an in-memory entry back on the clipboard"
+        );
+        assert!(selection.is_some());
+    }
+
+    /// A failure from the writer itself (the mock configured to error,
+    /// standing in for a real compositor round trip that failed) must be
+    /// reported, and must not leave a stale guard behind or claim
+    /// success.
+    #[test]
+    fn a_writer_failure_is_reported_and_leaves_no_guard() {
+        struct FailingWriter;
+        impl ClipboardWriter for FailingWriter {
+            type Guard = crate::write::mock::MockGuard;
+
+            fn set_selection(&self, _content: Content) -> anyhow::Result<Self::Guard> {
+                anyhow::bail!("no clipboard protocol available")
+            }
+        }
+
+        let (mut history, id) = history_with_one_entry();
+        let writer = FailingWriter;
+        let mut selection = None;
+        let line = format!(r#"{{"cmd":"set-clipboard","id":"{}"}}"#, id.as_str());
+
+        let (response, mutated) = handle_line(&mut history, true, &writer, &mut selection, &line);
+
+        assert!(!mutated);
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["ok"], false);
+        assert!(selection.is_none());
+    }
+
+    /// The decision Part 3 of the task asks to pin, with a comment
+    /// explaining it: the daemon's own watcher will see the clipboard
+    /// change it just made through `set-clipboard`, and will try to
+    /// `record` it like any other copy. Because `EntryId` is derived from
+    /// content (see `types::EntryId::of`), re-recording the very entry
+    /// that was just set is recognised as the *same* entry — it moves to
+    /// the top and its timestamp updates (arguably desirable: choosing
+    /// an old entry is exactly what should bump it back to the top of a
+    /// clipboard manager's list) — but it is never duplicated, and
+    /// nothing about it causes a second `set_selection` call, so there is
+    /// no loop: `record` only ever appends to `History`, it never talks
+    /// to a `ClipboardWriter`.
+    #[test]
+    fn the_watcher_seeing_its_own_set_clipboard_change_moves_the_entry_up_without_duplicating_or_looping(
+    ) {
+        let mut history = History::new();
+        history.record(
+            Recordable::new(Content::Text("older".into()), Sensitivity::Recordable).unwrap(),
+            1,
+        );
+        history.record(
+            Recordable::new(Content::Text("chosen".into()), Sensitivity::Recordable).unwrap(),
+            2,
+        );
+        let writer = crate::write::mock::MockWriter::new();
+        let mut selection = None;
+        // The user picks the older entry, well after "chosen" — bumping
+        // it back to the top is exactly what set-clipboard is for.
+        let older_id = history
+            .entries()
+            .iter()
+            .find(|e| e.content == Content::Text("older".into()))
+            .unwrap()
+            .id
+            .clone();
+        let line = format!(r#"{{"cmd":"set-clipboard","id":"{}"}}"#, older_id.as_str());
+        let (_response, mutated) = handle_line(&mut history, true, &writer, &mut selection, &line);
+        assert!(!mutated, "set-clipboard itself never touches History::save");
+
+        // The watcher loop now "sees" this daemon's own selection change
+        // and does exactly what it does for any other copy: calls
+        // `record` on it (see `bin/clipd.rs::record`). Simulated directly
+        // here since that requires no writer at all — `record` never
+        // takes one.
+        let recorded_again = history.record(
+            Recordable::new(Content::Text("older".into()), Sensitivity::Recordable).unwrap(),
+            3,
+        );
+        assert!(recorded_again, "the same content is still a valid record");
+
+        assert_eq!(
+            history.entries().len(),
+            2,
+            "recognised as the same entry, not appended as a duplicate"
+        );
+        assert_eq!(
+            history.entries()[0].content,
+            Content::Text("older".into()),
+            "choosing it moved it back to the top, same as any other re-copy"
+        );
+        assert_eq!(history.entries()[0].copied_at, 3);
+
+        // No loop: nothing above ever called `writer.set_selection` a
+        // second time. The only call recorded is the original
+        // `set-clipboard` request.
+        assert_eq!(writer.calls(), vec![Content::Text("older".into())]);
+    }
+
+    /// End-to-end over a real (throwaway) socket: `set-clipboard` against
+    /// a running server actually reaches the writer and the client sees
+    /// success, proving the client and server agree on this request's
+    /// wire shape the same way the existing pin round trip does.
+    #[tokio::test]
+    async fn the_client_sets_the_clipboard_against_a_real_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clipd-set-clipboard-test.sock");
+        let (history, id) = history_with_one_entry();
+        let shared = test_shared(history, true);
+
+        let serve_path = path.clone();
+        let serve_shared = Arc::clone(&shared);
+        let server = tokio::spawn(async move {
+            let _ = run_at(&serve_path, serve_shared).await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let client_path = path.clone();
+        let client_id = id.as_str().to_string();
+        tokio::task::spawn_blocking(move || {
+            set_clipboard_at(&client_path, &client_id, Duration::from_secs(2))
+        })
+        .await
+        .unwrap()
+        .expect("set-clipboard must succeed against a running daemon");
+
+        {
+            let selection = shared.selection.lock().await;
+            assert!(
+                selection.is_some(),
+                "the daemon must have kept the guard from its own set_selection call"
+            );
+        }
+
+        server.abort();
+    }
+
+    /// `set-clipboard` against an unknown id, over the real socket, must
+    /// come back as a refusal the client can see — not a silent success
+    /// and not a hang.
+    #[tokio::test]
+    async fn the_client_sees_a_refusal_for_an_unknown_id_over_the_real_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clipd-set-clipboard-unknown-test.sock");
+        let (history, _id) = history_with_one_entry();
+        let shared = test_shared(history, true);
+
+        let serve_path = path.clone();
+        let serve_shared = Arc::clone(&shared);
+        let server = tokio::spawn(async move {
+            let _ = run_at(&serve_path, serve_shared).await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let client_path = path.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            set_clipboard_at(&client_path, "not-a-real-id", Duration::from_secs(2))
+        })
+        .await
+        .unwrap();
+
+        assert!(matches!(result, Err(ClientError::Refused(_))), "got {result:?}");
 
         server.abort();
     }
