@@ -22,6 +22,8 @@
 //! elsewhere, which is not what "paste this" was asking for.
 
 use crate::types::{Content, Mime};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 /// Puts `content` on the clipboard.
 ///
@@ -31,9 +33,108 @@ use crate::types::{Content, Mime};
 /// right after this call returns would leave the clipboard empty. This
 /// method itself only has to make the compositor accept the new
 /// selection; keeping the source alive afterward is the implementation's
-/// job, not the caller's.
+/// job — it does that by handing the caller a [`SelectionGuard`] rather
+/// than by keeping the *process* alive on its own, since only the
+/// caller knows when it is done needing the source (typically: after
+/// synthesizing a paste). **The corollary is the caller's job, not this
+/// trait's**: a process that calls `set_selection` and then exits
+/// without waiting on the guard destroys the source out from under
+/// whoever tries to paste a moment later — see
+/// `crates/hyprforge-clipmenu/src/chooser.rs` for where that wait
+/// happens for the real popup.
 pub trait ClipboardWriter: Send + Sync {
-    fn set_selection(&self, content: Content) -> anyhow::Result<()>;
+    type Guard: SelectionGuard;
+
+    fn set_selection(&self, content: Content) -> anyhow::Result<Self::Guard>;
+}
+
+/// What became of a selection after [`ClipboardWriter::set_selection`]
+/// returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionOutcome {
+    /// The source answered at least one `Send` request — some client
+    /// actually read the clipboard. This is what a paste, synthetic or
+    /// manual, looks like from here.
+    Served,
+    /// The compositor reported `Cancelled`: another data source has
+    /// become the selection instead (most commonly the *next*
+    /// invocation of this same popup calling `set_selection` again).
+    /// Whatever this source would have served no longer matters to
+    /// anyone.
+    Superseded,
+    /// Neither happened before the caller's bound elapsed. The content
+    /// is still nominally the selection — nothing here un-set it — but
+    /// no compositor-cached copy exists once the owning process exits,
+    /// so a caller that gives up here and exits risks the next paste
+    /// attempt finding an empty clipboard.
+    TimedOut,
+}
+
+/// The other half of the promise `set_selection` used to make on its
+/// own: a way for the caller to learn when the source it just created is
+/// no longer needed, so the process can exit without either abandoning
+/// a paste in flight or lingering forever waiting for one that will
+/// never come.
+pub trait SelectionGuard: Send {
+    /// Blocks the calling thread until [`SelectionOutcome::Served`] or
+    /// [`SelectionOutcome::Superseded`] is known, or until `timeout`
+    /// elapses (reported as [`SelectionOutcome::TimedOut`]). Always
+    /// returns — never blocks forever, per CLAUDE.md's rule against
+    /// waiting on another process (here, another compositor client)
+    /// without a bound.
+    fn wait(&self, timeout: Duration) -> SelectionOutcome;
+}
+
+/// Shared between a source's background dispatch thread (which calls
+/// [`Self::signal`] once it knows the outcome) and the [`SelectionGuard`]
+/// handed back to the caller (which calls [`Self::wait`]). Pure
+/// synchronization over a `Condvar` — no Wayland involved — which is
+/// exactly what makes it testable without a compositor; see the tests
+/// below.
+///
+/// `pub` rather than `pub(crate)` only because [`crate::wayland::WaylandWriter`]
+/// names `Arc<Waiter>` as [`ClipboardWriter::Guard`], which an
+/// associated type cannot expose as anything less visible than the
+/// trait impl itself; nothing outside this crate constructs one.
+#[derive(Default)]
+pub struct Waiter {
+    outcome: Mutex<Option<SelectionOutcome>>,
+    condvar: Condvar,
+}
+
+impl Waiter {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Records `outcome`, waking anyone blocked in [`Self::wait`].
+    ///
+    /// Only the *first* signal counts: `Served` can fire more than once
+    /// (a target can ask for more than one MIME type in the same
+    /// paste) and a `Cancelled` can in principle arrive after a `Send`
+    /// this same source already answered. Whichever happened first is
+    /// the one a caller waiting on this needs to hear — overwriting it
+    /// with whatever comes after would let a late `Cancelled` mask an
+    /// already-successful `Served` that a caller may already have acted
+    /// on having been woken by it.
+    pub(crate) fn signal(&self, outcome: SelectionOutcome) {
+        let mut guard = self.outcome.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            *guard = Some(outcome);
+            self.condvar.notify_all();
+        }
+    }
+}
+
+impl SelectionGuard for Arc<Waiter> {
+    fn wait(&self, timeout: Duration) -> SelectionOutcome {
+        let guard = self.outcome.lock().unwrap_or_else(|e| e.into_inner());
+        let (guard, _timed_out) = self
+            .condvar
+            .wait_timeout_while(guard, timeout, |outcome| outcome.is_none())
+            .unwrap_or_else(|e| e.into_inner());
+        guard.unwrap_or(SelectionOutcome::TimedOut)
+    }
 }
 
 /// Which MIME types to advertise for a piece of content.
@@ -73,19 +174,41 @@ pub fn bytes_for(content: &Content, requested: &Mime) -> Option<Vec<u8>> {
 #[cfg(any(test, feature = "mock"))]
 pub mod mock {
     use super::*;
-    use std::sync::Mutex;
 
     /// Records every call rather than talking to a compositor — for the
     /// popup's own tests. Never actually touches the machine's real
     /// clipboard.
-    #[derive(Default)]
+    ///
+    /// Reports [`SelectionOutcome::Served`] from every guard it hands
+    /// out by default — a test exercising the "nothing ever asked for
+    /// it" path can override that with [`Self::with_outcome`].
     pub struct MockWriter {
         calls: Mutex<Vec<Content>>,
+        outcome: SelectionOutcome,
+    }
+
+    impl Default for MockWriter {
+        fn default() -> Self {
+            MockWriter {
+                calls: Mutex::new(Vec::new()),
+                outcome: SelectionOutcome::Served,
+            }
+        }
     }
 
     impl MockWriter {
         pub fn new() -> Self {
             Self::default()
+        }
+
+        /// A mock whose guards report `outcome` instead of the default
+        /// `Served` — for testing a caller's reaction to `Superseded`
+        /// or `TimedOut` without a compositor.
+        pub fn with_outcome(outcome: SelectionOutcome) -> Self {
+            MockWriter {
+                calls: Mutex::new(Vec::new()),
+                outcome,
+            }
         }
 
         /// Every `set_selection` call so far, in order.
@@ -105,13 +228,25 @@ pub mod mock {
         }
     }
 
+    /// A guard that reports a fixed, already-known outcome — standing in
+    /// for a real [`Waiter`] without any thread or timing involved.
+    pub struct MockGuard(SelectionOutcome);
+
+    impl SelectionGuard for MockGuard {
+        fn wait(&self, _timeout: Duration) -> SelectionOutcome {
+            self.0
+        }
+    }
+
     impl ClipboardWriter for MockWriter {
-        fn set_selection(&self, content: Content) -> anyhow::Result<()> {
+        type Guard = MockGuard;
+
+        fn set_selection(&self, content: Content) -> anyhow::Result<Self::Guard> {
             self.calls
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push(content);
-            Ok(())
+            Ok(MockGuard(self.outcome))
         }
     }
 }
@@ -190,5 +325,57 @@ mod tests {
             .unwrap();
         assert_eq!(writer.calls().len(), 2);
         assert_eq!(writer.last_offered(), Some(vec![Mime::new("image/png")]));
+    }
+
+    /// A mock configured with a non-default outcome hands it out from
+    /// every guard — this is what lets a caller's timeout-handling be
+    /// tested without a compositor or a real timer.
+    #[test]
+    fn a_mock_writer_can_be_configured_to_report_timing_out() {
+        let writer = mock::MockWriter::with_outcome(SelectionOutcome::TimedOut);
+        let guard = writer
+            .set_selection(Content::Text("x".to_string()))
+            .unwrap();
+        assert_eq!(guard.wait(Duration::from_secs(0)), SelectionOutcome::TimedOut);
+    }
+
+    /// The property the whole `Waiter` type exists for: a signal that
+    /// arrives well before the bound wakes `wait` immediately rather
+    /// than making it sit out the full timeout.
+    #[test]
+    fn a_waiter_wakes_as_soon_as_it_is_signalled() {
+        let waiter = Waiter::new();
+        let signaller = waiter.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            signaller.signal(SelectionOutcome::Served);
+        });
+        let started = std::time::Instant::now();
+        let outcome = waiter.wait(Duration::from_secs(10));
+        assert_eq!(outcome, SelectionOutcome::Served);
+        // Generous margin over the 20ms sleep — this only has to prove
+        // the wait ended long before the 10s bound, not pin an exact
+        // wakeup latency.
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// With nobody ever signalling, `wait` still returns — the whole
+    /// point of a bounded wait — rather than hanging forever.
+    #[test]
+    fn an_unsignalled_waiter_times_out_rather_than_blocking_forever() {
+        let waiter = Waiter::new();
+        let outcome = waiter.wait(Duration::from_millis(20));
+        assert_eq!(outcome, SelectionOutcome::TimedOut);
+    }
+
+    /// Pins the "first signal wins" rule: a late `Cancelled` must not
+    /// overwrite a `Served` a caller may already have been woken by and
+    /// acted on.
+    #[test]
+    fn only_the_first_signal_is_kept() {
+        let waiter = Waiter::new();
+        waiter.signal(SelectionOutcome::Served);
+        waiter.signal(SelectionOutcome::Superseded);
+        assert_eq!(waiter.wait(Duration::from_millis(0)), SelectionOutcome::Served);
     }
 }

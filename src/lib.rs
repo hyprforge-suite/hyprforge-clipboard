@@ -28,4 +28,4 @@ pub use paste::{PasteOutcome, PasteSynthesizer};
 pub use store::{History, HistoryError, Recordable};
 pub use types::{Content, Entry, EntryId, Mime, Sensitivity};
 pub use wayland::{WaylandPaster, WaylandWatcher, WaylandWriter};
-pub use write::ClipboardWriter;
+pub use write::{ClipboardWriter, SelectionGuard, SelectionOutcome};

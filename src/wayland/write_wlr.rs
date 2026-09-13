@@ -3,11 +3,13 @@
 //! unavailable. Structurally identical to `write_ext.rs`, for the same
 //! reason `wlr.rs` mirrors `ext.rs` on the read side: same requests, same
 //! events, a different generated Rust type for each. See `write_ext.rs`
-//! for why the source must outlive this function's return.
+//! for why the source must outlive this function's return, and for what
+//! `Waiter` is doing here.
 
 use crate::types::{Content, Mime};
 use crate::wayland::pipe;
-use crate::write::{bytes_for, mimes_to_offer};
+use crate::write::{bytes_for, mimes_to_offer, SelectionOutcome, Waiter};
+use std::sync::Arc;
 use wayland_client::protocol::{wl_registry, wl_seat};
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
 use wayland_protocols_wlr::data_control::v1::client::{
@@ -21,6 +23,7 @@ struct State {
     seat: Option<wl_seat::WlSeat>,
     content: Content,
     done: bool,
+    waiter: Arc<Waiter>,
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for State {
@@ -81,6 +84,13 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for State {
         if let zwlr_data_control_device_v1::Event::Finished = event {
             tracing::warn!("compositor closed the zwlr-data-control-v1 device while writing");
             state.done = true;
+            // The device is gone; nothing will ever serve this source
+            // now. Signalling `Superseded` (rather than leaving the
+            // guard to sit out the rest of its timeout) is the same
+            // "someone else owns the clipboard now" shape — the source
+            // is definitely not going to be pasted from through this
+            // connection either way.
+            state.waiter.signal(SelectionOutcome::Superseded);
         }
     }
 }
@@ -98,10 +108,17 @@ impl Dispatch<ZwlrDataControlSourceV1, ()> for State {
             zwlr_data_control_source_v1::Event::Send { mime_type, fd } => {
                 let bytes = bytes_for(&state.content, &Mime::new(mime_type)).unwrap_or_default();
                 pipe::send(fd, bytes);
+                // Someone actually read the clipboard — signal this
+                // before continuing to serve, since a second `Send` for
+                // another MIME type in the same paste must not
+                // overwrite this with a later outcome (see `Waiter`'s
+                // "first signal wins" doc).
+                state.waiter.signal(SelectionOutcome::Served);
             }
             zwlr_data_control_source_v1::Event::Cancelled => {
                 source.destroy();
                 state.done = true;
+                state.waiter.signal(SelectionOutcome::Superseded);
             }
             _ => {}
         }
@@ -109,17 +126,19 @@ impl Dispatch<ZwlrDataControlSourceV1, ()> for State {
 }
 
 /// See `write_ext::set_selection` — identical shape, the older protocol.
-pub fn set_selection(content: Content) -> anyhow::Result<()> {
+pub fn set_selection(content: Content) -> anyhow::Result<Arc<Waiter>> {
     let connection = Connection::connect_to_env()?;
     let display = connection.display();
     let mut event_queue = connection.new_event_queue::<State>();
     let qh = event_queue.handle();
 
+    let waiter = Waiter::new();
     let mut state = State {
         manager: None,
         seat: None,
         content,
         done: false,
+        waiter: waiter.clone(),
     };
 
     let _registry = display.get_registry(&qh, ());
@@ -149,10 +168,15 @@ pub fn set_selection(content: Content) -> anyhow::Result<()> {
                 }
                 if let Err(e) = event_queue.blocking_dispatch(&mut state) {
                     tracing::warn!(error = %e, "zwlr-data-control-v1 write connection closed; the clipboard may now be empty");
+                    // The connection is gone; signal so a caller
+                    // blocked in `Waiter::wait` does not sit out the
+                    // rest of its timeout for an answer that can no
+                    // longer come.
+                    state.waiter.signal(SelectionOutcome::Superseded);
                     break;
                 }
             }
         })?;
 
-    Ok(())
+    Ok(waiter)
 }

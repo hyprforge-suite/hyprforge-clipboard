@@ -29,7 +29,7 @@ mod write_wlr;
 
 use crate::backend::ClipboardWatcher;
 use crate::types::{Content, Entry};
-use crate::write::ClipboardWriter;
+use crate::write::{ClipboardWriter, Waiter};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
@@ -109,9 +109,11 @@ impl Default for WaylandWriter {
 }
 
 impl ClipboardWriter for WaylandWriter {
-    fn set_selection(&self, content: Content) -> anyhow::Result<()> {
+    type Guard = Arc<Waiter>;
+
+    fn set_selection(&self, content: Content) -> anyhow::Result<Self::Guard> {
         match write_ext::set_selection(content.clone()) {
-            Ok(()) => Ok(()),
+            Ok(waiter) => Ok(waiter),
             Err(e) => {
                 tracing::info!(
                     error = %e,

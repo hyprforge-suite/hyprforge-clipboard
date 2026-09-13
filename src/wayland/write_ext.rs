@@ -19,10 +19,26 @@
 //! returns would destroy the source out from under whoever tries to
 //! paste a second later, and the clipboard would read as empty. This is
 //! the bug CLAUDE.md calls out by name for this part of the task.
+//!
+//! # The *process* must outlive this function too
+//!
+//! Keeping the dispatch thread alive is necessary but not sufficient: a
+//! detached thread dies with the process, and nothing here makes the
+//! process itself wait. That was the actual bug behind "it just does
+//! not paste" — `hyprforge-clipmenu` set the selection, synthesized
+//! Ctrl+V, and exited in the same breath the synthetic keypress was
+//! sent, tearing down this very thread before the target application's
+//! `Send` request could ever arrive. `set_selection` now returns a
+//! [`crate::write::SelectionGuard`] (here, `Arc<Waiter>` — see
+//! `Waiter::wait`'s impl for it) so the *caller* can block, with a
+//! bound, until this thread reports [`SelectionOutcome::Served`] or
+//! [`SelectionOutcome::Superseded`] — see
+//! `crates/hyprforge-clipmenu/src/chooser.rs::Wired::choose`.
 
 use crate::types::{Content, Mime};
 use crate::wayland::pipe;
-use crate::write::{bytes_for, mimes_to_offer};
+use crate::write::{bytes_for, mimes_to_offer, SelectionOutcome, Waiter};
+use std::sync::Arc;
 use wayland_client::protocol::{wl_registry, wl_seat};
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
 use wayland_protocols::ext::data_control::v1::client::{
@@ -40,6 +56,9 @@ struct State {
     /// the dispatch loop below checks this after every event and exits,
     /// which is what lets the thread end instead of running forever.
     done: bool,
+    /// What tells whoever is blocked in [`crate::write::SelectionGuard::wait`]
+    /// that this source is no longer needed.
+    waiter: Arc<Waiter>,
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for State {
@@ -104,6 +123,10 @@ impl Dispatch<ExtDataControlDeviceV1, ()> for State {
         if let ext_data_control_device_v1::Event::Finished = event {
             tracing::warn!("compositor closed the ext-data-control-v1 device while writing");
             state.done = true;
+            // Nothing can be served through this device anymore; let a
+            // waiting caller stop waiting now rather than at its
+            // timeout.
+            state.waiter.signal(SelectionOutcome::Superseded);
         }
     }
 }
@@ -121,6 +144,13 @@ impl Dispatch<ExtDataControlSourceV1, ()> for State {
             ext_data_control_source_v1::Event::Send { mime_type, fd } => {
                 let bytes = bytes_for(&state.content, &Mime::new(mime_type)).unwrap_or_default();
                 pipe::send(fd, bytes);
+                // The paste actually happened. Signalled before
+                // continuing to serve (rather than only once `done`),
+                // since a caller waiting on this needs to know as soon
+                // as it is true, and a second `Send` for another MIME
+                // type in the same paste must not override it (see
+                // `Waiter`'s "first signal wins" doc).
+                state.waiter.signal(SelectionOutcome::Served);
             }
             ext_data_control_source_v1::Event::Cancelled => {
                 // "This data source is no longer valid. The data source
@@ -130,6 +160,7 @@ impl Dispatch<ExtDataControlSourceV1, ()> for State {
                 // for, not a failure.
                 source.destroy();
                 state.done = true;
+                state.waiter.signal(SelectionOutcome::Superseded);
             }
             _ => {}
         }
@@ -144,17 +175,24 @@ impl Dispatch<ExtDataControlSourceV1, ()> for State {
 /// advertise this protocol at all — the caller's cue to try
 /// `write_wlr::set_selection` instead, matching `ext::connect`'s own
 /// fallback contract on the read side.
-pub fn set_selection(content: Content) -> anyhow::Result<()> {
+///
+/// Returns the [`Waiter`] the caller waits on (through
+/// [`crate::write::SelectionGuard::wait`]) to learn when the source it
+/// just created is no longer needed — see this module's "the process
+/// must outlive this function too" doc.
+pub fn set_selection(content: Content) -> anyhow::Result<Arc<Waiter>> {
     let connection = Connection::connect_to_env()?;
     let display = connection.display();
     let mut event_queue = connection.new_event_queue::<State>();
     let qh = event_queue.handle();
 
+    let waiter = Waiter::new();
     let mut state = State {
         manager: None,
         seat: None,
         content,
         done: false,
+        waiter: waiter.clone(),
     };
 
     let _registry = display.get_registry(&qh, ());
@@ -188,10 +226,11 @@ pub fn set_selection(content: Content) -> anyhow::Result<()> {
                 }
                 if let Err(e) = event_queue.blocking_dispatch(&mut state) {
                     tracing::warn!(error = %e, "ext-data-control-v1 write connection closed; the clipboard may now be empty");
+                    state.waiter.signal(SelectionOutcome::Superseded);
                     break;
                 }
             }
         })?;
 
-    Ok(())
+    Ok(waiter)
 }
