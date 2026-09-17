@@ -7,8 +7,9 @@
 //! `Waiter` is doing here.
 
 use crate::types::{Content, Mime};
+use crate::write::Offers;
 use crate::wayland::pipe;
-use crate::write::{bytes_for, mimes_to_offer, SelectionOutcome, Waiter};
+use crate::write::{SelectionOutcome, Waiter};
 use std::sync::Arc;
 use wayland_client::protocol::{wl_registry, wl_seat};
 use wayland_client::{event_created_child, Connection, Dispatch, Proxy, QueueHandle};
@@ -22,7 +23,8 @@ use wayland_protocols_wlr::data_control::v1::client::{
 struct State {
     manager: Option<ZwlrDataControlManagerV1>,
     seat: Option<wl_seat::WlSeat>,
-    content: Content,
+    /// What this source advertises, and what it answers each type with.
+    offers: Offers,
     done: bool,
     waiter: Arc<Waiter>,
 }
@@ -116,7 +118,7 @@ impl Dispatch<ZwlrDataControlSourceV1, ()> for State {
     ) {
         match event {
             zwlr_data_control_source_v1::Event::Send { mime_type, fd } => {
-                let bytes = bytes_for(&state.content, &Mime::new(mime_type)).unwrap_or_default();
+                let bytes = state.offers.bytes_for(&Mime::new(mime_type));
                 pipe::send(fd, bytes);
                 // Someone actually read the clipboard — signal this
                 // before continuing to serve, since a second `Send` for
@@ -137,6 +139,11 @@ impl Dispatch<ZwlrDataControlSourceV1, ()> for State {
 
 /// See `write_ext::set_selection` — identical shape, the older protocol.
 pub fn set_selection(content: Content) -> anyhow::Result<Arc<Waiter>> {
+    set_offers(Offers::of(&content))
+}
+
+/// [`set_selection`] for exactly these types and bytes — see [`Offers`].
+pub fn set_offers(offers: Offers) -> anyhow::Result<Arc<Waiter>> {
     let connection = Connection::connect_to_env()?;
     let display = connection.display();
     let mut event_queue = connection.new_event_queue::<State>();
@@ -146,7 +153,7 @@ pub fn set_selection(content: Content) -> anyhow::Result<Arc<Waiter>> {
     let mut state = State {
         manager: None,
         seat: None,
-        content,
+        offers,
         done: false,
         waiter: waiter.clone(),
     };
@@ -163,7 +170,7 @@ pub fn set_selection(content: Content) -> anyhow::Result<Arc<Waiter>> {
 
     let device = manager.get_data_device(&seat, &qh, ());
     let source = manager.create_data_source(&qh, ());
-    for mime in mimes_to_offer(&state.content) {
+    for mime in state.offers.mimes() {
         source.offer(mime.as_str().to_string());
     }
     device.set_selection(Some(&source));

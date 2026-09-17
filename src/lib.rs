@@ -28,5 +28,5 @@ pub use backend::ClipboardWatcher;
 pub use paste::{PasteOutcome, PasteSynthesizer, Shortcut};
 pub use store::{History, HistoryError, Recordable};
 pub use types::{Content, Entry, EntryId, Mime, Sensitivity};
-pub use wayland::{WaylandPaster, WaylandWatcher, WaylandWriter};
-pub use write::{ClipboardWriter, SelectionGuard, SelectionOutcome};
+pub use wayland::{read_selection, WaylandPaster, WaylandWatcher, WaylandWriter};
+pub use write::{ClipboardWriter, Offers, SelectionGuard, SelectionOutcome};

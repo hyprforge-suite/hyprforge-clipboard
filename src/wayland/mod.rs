@@ -23,13 +23,14 @@
 mod ext;
 mod keyboard;
 mod pipe;
+mod read_ext;
 mod wlr;
 mod write_ext;
 mod write_wlr;
 
 use crate::backend::ClipboardWatcher;
-use crate::types::{Content, Entry};
-use crate::write::{ClipboardWriter, Waiter};
+use crate::types::{Content, Entry, Mime};
+use crate::write::{ClipboardWriter, Offers, Waiter};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
@@ -99,6 +100,58 @@ pub struct WaylandWriter;
 impl WaylandWriter {
     pub fn new() -> Self {
         WaylandWriter
+    }
+}
+
+impl WaylandWriter {
+    /// Makes exactly these types and bytes the clipboard's content —
+    /// [`ClipboardWriter::set_selection`] for callers whose content is
+    /// not text or an image. Same `ext`-then-`wlr` fallback.
+    ///
+    /// An empty [`Offers`] leaves a selection that offers nothing, which
+    /// is how a caller empties the clipboard it owns.
+    pub fn set_offers(&self, offers: Offers) -> anyhow::Result<Arc<Waiter>> {
+        match write_ext::set_offers(offers.clone()) {
+            Ok(waiter) => Ok(waiter),
+            Err(e) => {
+                tracing::info!(
+                    error = %e,
+                    "ext-data-control-v1 unavailable for writing; falling back to zwlr-data-control-v1"
+                );
+                write_wlr::set_offers(offers).map_err(|e| {
+                    anyhow::anyhow!(
+                        "no clipboard protocol available to write to (tried ext-data-control-v1, then zwlr-data-control-v1): {e}"
+                    )
+                })
+            }
+        }
+    }
+}
+
+/// The current selection in the first of `preferred` it offers, read
+/// once — or `Ok(None)` when the clipboard is empty or offers none of
+/// them.
+///
+/// Bounded by `timeout` as a whole, round trips included: the
+/// compositor is another process, and `roundtrip` has no timeout of its
+/// own. The work runs on its own thread, which is left behind if the
+/// bound is hit — the same trade `pipe::receive` makes and documents.
+///
+/// `ext-data-control-v1` only; see `read_ext`'s module doc for what a
+/// `wlr`-only compositor gets instead.
+pub fn read_selection(
+    preferred: Vec<Mime>,
+    timeout: std::time::Duration,
+) -> anyhow::Result<Option<(Mime, Vec<u8>)>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("hyprforge-clip-read-once".to_string())
+        .spawn(move || {
+            let _ = tx.send(read_ext::read(&preferred));
+        })?;
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!("the compositor did not answer a clipboard read in time")),
     }
 }
 

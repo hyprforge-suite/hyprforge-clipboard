@@ -171,6 +171,68 @@ pub fn bytes_for(content: &Content, requested: &Mime) -> Option<Vec<u8>> {
     }
 }
 
+/// Exactly what a data source advertises, and the bytes it answers each
+/// type with.
+///
+/// [`mimes_to_offer`] and [`bytes_for`] decide this for clipboard
+/// [`Content`] — text and images. Some callers have a different shape of
+/// thing to put on the clipboard: a file manager's copied files are a
+/// `text/uri-list`, an `x-special/gnome-copied-files` and a plain-text
+/// fallback, all at once, none of which is `Content`. `Offers` is the
+/// level both meet at, so the writers only ever serve this.
+///
+/// `Debug` shows the types and byte counts and never the bytes, for the
+/// reason this crate's module doc gives: what is on a clipboard is
+/// nobody's business in a log.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct Offers {
+    entries: Vec<(Mime, Vec<u8>)>,
+}
+
+impl Offers {
+    /// These types, in this order — the order a paste target sees them
+    /// offered, which some targets treat as a preference.
+    pub fn new(entries: Vec<(Mime, Vec<u8>)>) -> Self {
+        Offers { entries }
+    }
+
+    /// What [`ClipboardWriter::set_selection`] offers for `content`.
+    pub fn of(content: &Content) -> Self {
+        Offers::new(
+            mimes_to_offer(content)
+                .into_iter()
+                .map(|mime| {
+                    let bytes = bytes_for(content, &mime).unwrap_or_default();
+                    (mime, bytes)
+                })
+                .collect(),
+        )
+    }
+
+    pub fn mimes(&self) -> impl Iterator<Item = &Mime> {
+        self.entries.iter().map(|(mime, _)| mime)
+    }
+
+    /// The bytes for `requested`, or nothing for a type that was never
+    /// offered — a source must still answer *something* rather than
+    /// write nothing at all to a paste target's pipe.
+    pub fn bytes_for(&self, requested: &Mime) -> Vec<u8> {
+        self.entries
+            .iter()
+            .find(|(mime, _)| mime == requested)
+            .map(|(_, bytes)| bytes.clone())
+            .unwrap_or_default()
+    }
+}
+
+impl std::fmt::Debug for Offers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.entries.iter().map(|(mime, bytes)| format!("{} ({} bytes)", mime.as_str(), bytes.len())))
+            .finish()
+    }
+}
+
 #[cfg(any(test, feature = "mock"))]
 pub mod mock {
     use super::*;
@@ -254,6 +316,32 @@ pub mod mock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offers_for_text_are_what_set_selection_always_offered() {
+        let content = Content::Text("hello".into());
+        let offers = Offers::of(&content);
+        let mimes: Vec<Mime> = offers.mimes().cloned().collect();
+        assert_eq!(mimes, mimes_to_offer(&content));
+        for mime in &mimes {
+            assert_eq!(offers.bytes_for(mime), b"hello");
+        }
+    }
+
+    #[test]
+    fn a_type_that_was_not_offered_answers_with_nothing() {
+        let offers = Offers::new(vec![(Mime::new("text/uri-list"), b"file:///a".to_vec())]);
+        assert!(offers.bytes_for(&Mime::new("image/png")).is_empty());
+    }
+
+    /// What is on a clipboard never reaches a log through `Debug`.
+    #[test]
+    fn debugging_offers_shows_sizes_not_content() {
+        let offers = Offers::new(vec![(Mime::new("text/plain"), b"hunter2".to_vec())]);
+        let shown = format!("{offers:?}");
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(shown.contains("text/plain (7 bytes)"), "{shown}");
+    }
 
     /// The property Part 1 of the task exists to pin: text offers both
     /// plain-text MIME types.

@@ -348,3 +348,39 @@ fn the_current_selections_mime_types_can_be_enumerated_without_reading_content()
         }
     }
 }
+
+/// `read_selection`'s one round trip, against the real compositor —
+/// asked for a type no application offers, so it can only answer "none"
+/// and never receives a byte of the user's clipboard.
+///
+/// What this proves is the part a unit test cannot: that creating a
+/// device really does deliver the current selection within one round
+/// trip, which is the assumption the whole one-shot read rests on. If
+/// the compositor delivered it later, this would still return `Ok(None)`
+/// — so the test also requires the call to finish well inside its bound,
+/// which a read that had to wait for a late event would not.
+#[test]
+#[ignore]
+fn a_one_shot_read_completes_without_reading_anything() {
+    if connection_or_skip().is_none() {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let result = hyprforge_clipboard::read_selection(
+        vec![hyprforge_clipboard::Mime::new("application/x-hyprforge-never-offered")],
+        Duration::from_secs(2),
+    );
+    match result {
+        Ok(found) => assert_eq!(found, None, "nothing offers this type"),
+        Err(e) if e.to_string().contains("does not advertise ext-data-control") => {
+            eprintln!("{SKIP_MARKER} compositor has no ext-data-control-v1 ({e})");
+            return;
+        }
+        Err(e) => panic!("the one-shot read failed against the real compositor: {e}"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "took {:?} — the selection did not arrive within one round trip",
+        started.elapsed()
+    );
+}
