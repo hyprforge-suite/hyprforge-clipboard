@@ -20,6 +20,16 @@ categories = ["os::linux-apis", "gui"]
 name = "hyprforge-clipd"
 path = "src/bin/clipd.rs"
 
+# The history popup, in this crate rather than beside it. It is a
+# separate *binary* — a keybind launches it — and a binary cannot be
+# fetched as a dependency the way a library can, so it has to be inside
+# the one directory `git subtree split` publishes or the clipboard's
+# repository ships a daemon with no way to see the history. It did, for
+# a while. See repo-plan.md, "The shape a package has to have".
+[[bin]]
+name = "hyprforge-clipmenu"
+path = "src/bin/clipmenu/main.rs"
+
 [dependencies]
 # The compositor is the only source of clipboard content, over
 # wlr-data-control / ext-data-control. No daemon of our own owns it.
@@ -84,6 +94,27 @@ tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "ti
 # inherit from. Inside the workspace this still resolves to the same
 # `serde_json = "1"` several other crates already depend on.
 serde_json = "1"
+
+# Used only by the `hyprforge-clipmenu` binary. Cargo has no way to scope
+# a dependency to one target of a crate that has several, the same
+# arrangement `hyprforge-tray` and `hyprforge-displayd` carry.
+#
+# The popup draws into a raw Wayland buffer, so it needs iced's pieces
+# directly rather than the `iced` umbrella: there is no winit window
+# here. `iced_tiny_skia` and not `iced_wgpu` — see CLAUDE.md on
+# `web-colors`, which is why every surface in this suite is drawn by the
+# same renderer. `image` on both, for the thumbnails a copied picture
+# gets.
+hyprforge-popup = { git = "https://github.com/adamrpostjr/hyprforge" }
+hyprforge-appearance = { git = "https://github.com/adamrpostjr/hyprforge" }
+hyprforge-look = { git = "https://github.com/adamrpostjr/hyprforge" }
+hyprforge-process = { git = "https://github.com/adamrpostjr/hyprforge" }
+iced_tiny_skia = { version = "0.14", default-features = false, features = ["image", "wayland"] }
+iced_runtime = "0.14"
+iced_widget = { version = "0.14", features = ["image"] }
+iced_renderer = { version = "0.14", default-features = false, features = ["tiny-skia"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+clap = { version = "4.6", features = ["derive"] }
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "sync", "time", "test-util"] }
