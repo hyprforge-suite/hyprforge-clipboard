@@ -19,7 +19,7 @@
 //! under the 36-megapixel image that produced a 296MB decode. Decoded
 //! RGBA8 at the cap is 16,777,216 * 4 bytes = 64MB for one image; the
 //! popup only ever builds a handle for rows in the visible window (see
-//! `model::Model::set_window`), so the worst case is that window's worth of
+//! `model::Model::stack`'s visible lines), so the worst case is that window's worth of
 //! 64MB images, not the whole history's.
 
 use hyprforge_clipboard::{Content, Entry};
@@ -76,11 +76,12 @@ fn decode(bytes: &[u8]) -> Option<Handle> {
 ///
 /// Populated lazily, only for entries [`Cache::get`] is actually asked
 /// about — which the popup only calls for rows in the current visible
-/// window (see `model::Model::visible_range`). An entry that never
+/// window (see `model::Model::stack`). An entry that never
 /// scrolls into view is never decoded at all.
 #[derive(Default)]
 pub struct Cache {
     handles: HashMap<hyprforge_clipboard::EntryId, Option<Handle>>,
+    sizes: HashMap<hyprforge_clipboard::EntryId, Option<(u32, u32)>>,
 }
 
 impl Cache {
@@ -96,6 +97,24 @@ impl Cache {
             return None;
         };
         self.handles.entry(entry.id.clone()).or_insert_with(|| decode(bytes)).clone()
+    }
+
+    /// An image entry's width and height, from its header alone — the
+    /// preview pane's "1440 × 900", which must be answerable even for an
+    /// image over the decode cap, since saying how big it is costs
+    /// nothing and is exactly what someone wondering why there is no
+    /// thumbnail wants to know.
+    pub fn size(&mut self, entry: &Entry) -> Option<(u32, u32)> {
+        let Content::Image { bytes, .. } = &entry.content else {
+            return None;
+        };
+        *self.sizes.entry(entry.id.clone()).or_insert_with(|| dimensions(bytes))
+    }
+
+    /// Whether `entry` is an image too large to decode for a thumbnail,
+    /// so the pane can say so rather than showing an empty box.
+    pub fn over_cap(&mut self, entry: &Entry) -> bool {
+        self.size(entry).is_some_and(|(w, h)| !fits_within_cap(w, h))
     }
 }
 
@@ -147,6 +166,15 @@ mod tests {
             pinned: false,
         };
         assert!(cache.get(&entry).is_none());
+    }
+
+    #[test]
+    fn an_images_size_is_read_from_its_header_and_text_has_none() {
+        let mut cache = Cache::new();
+        assert_eq!(cache.size(&image_entry(tiny_png())), Some((1, 1)));
+        assert!(!cache.over_cap(&image_entry(tiny_png())));
+        let text = Entry { id: EntryId::of(&Content::Text("hi".into())), content: Content::Text("hi".into()), copied_at: 0, pinned: false };
+        assert_eq!(cache.size(&text), None);
     }
 
     #[test]

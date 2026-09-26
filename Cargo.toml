@@ -113,8 +113,15 @@ iced_tiny_skia = { version = "0.14.1", default-features = false, features = ["im
 iced_runtime = "0.14"
 iced_widget = { version = "0.14", features = ["image"] }
 iced_renderer = { version = "0.14", default-features = false, features = ["tiny-skia"] }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+# bmp, tiff and ico because the workspace root has them: this list is
+# what the standalone repository builds with, and it must be at least the
+# root's for that build to be the one that was tested.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp", "tiff", "ico"] }
 clap = { version = "4.6", features = ["derive"] }
+# The popup's preview pane shows when an entry was copied in local
+# wall-clock time. Spelled exactly as the workspace table pins it — see
+# CLAUDE.md on a standalone crate's hand-copied versions drifting.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "sync", "time", "test-util"] }
