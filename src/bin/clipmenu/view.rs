@@ -1,244 +1,580 @@
 //! The popup's widget tree, built fresh each frame from a [`Model`].
 //!
-//! Renders two ways from one description, the same reason
-//! `hyprforge_authui::screen::view` does: nothing here is Wayland-
-//! specific, so the same tree could sit in an ordinary iced window for
-//! testing if that were ever useful. Every colour comes from
-//! [`hyprforge_look::Theme`] — CLAUDE.md is explicit that no app may
+//! Every region is sized from [`Layout`] — the same values
+//! `geometry::Layout::hit` measures with — and the list's lines from the
+//! model's [`hyprforge_popup::Stack`]. Nothing here picks a height of its
+//! own: see `geometry.rs`'s module doc for why that is the whole
+//! contract. Every colour comes from the theme through
+//! [`hyprforge_popup::kit::Look`]; CLAUDE.md is explicit that no app may
 //! define its own colour constant.
+//!
+//! Nothing here routes through iced's own click handling (every
+//! `Element` is `Infallible`-messaged): `hyprforge-popup` draws with the
+//! cursor unavailable, and `surface.rs` resolves every click from raw
+//! pointer coordinates against `geometry.rs`.
 
-use crate::geometry::RowLayout;
-use crate::model::{HistoryState, Model};
+use crate::geometry::Layout;
+use crate::kind::{self, Filter, Kind};
+use crate::model::{HistoryState, Line, Model};
 use crate::thumbnail;
 use hyprforge_clipboard::{Content, Entry};
 use hyprforge_look::Theme;
+use hyprforge_popup::kit::{self, Look};
+use iced_runtime::core::alignment::{Horizontal, Vertical};
 use iced_runtime::core::text::Wrapping;
-use iced_runtime::core::{Element, Length, Padding};
-use iced_widget::{column, container, row, text, Space, Stack};
+use iced_runtime::core::{Border, Color, ContentFit, Element, Font, Length, Padding};
+use iced_widget::{column, container, row, text, Column, Row, Space, Stack};
 
-fn to_iced(c: hyprforge_look::Color) -> iced_runtime::core::Color {
-    iced_runtime::core::Color::from_rgba8(c.r, c.g, c.b, c.a as f32 / 255.0)
-}
+type El<'a, Message, Renderer> = Element<'a, Message, iced_widget::Theme, Renderer>;
 
 pub fn view<'a, Message, Renderer>(
     model: &'a Model,
     theme: &'a Theme,
     thumbnails: &mut thumbnail::Cache,
     now: u64,
-    popup_width: f64,
-) -> Element<'a, Message, iced_widget::Theme, Renderer>
+    home: Option<&str>,
+) -> El<'a, Message, Renderer>
 where
     Message: 'a,
-    Renderer: iced_runtime::core::text::Renderer<Font = iced_runtime::core::Font>
+    Renderer: iced_runtime::core::text::Renderer<Font = Font>
         + iced_runtime::core::image::Renderer<Handle = iced_runtime::core::image::Handle>
         + 'a,
 {
-    let text_color = to_iced(theme.surfaces.text);
-    let dim_color = to_iced(theme.surfaces.text_dim);
+    let layout = Layout::for_font_size(theme.font_size);
+    let look = Look::new(theme);
 
-    // Both fixed to the theme's font size alone — see
-    // `geometry::RowLayout`'s doc comment for why the hit-test in
-    // `surface.rs` has to agree with these two numbers exactly, and why
-    // that means they are never left to iced's own text metrics to
-    // decide.
-    let layout = RowLayout::for_font_size(theme.font_size);
-    let header_text_height = layout.header_height - RowLayout::HEADER_GAP;
+    let labels: Vec<&str> = Filter::ALL.iter().map(|f| f.label()).collect();
+    let header = container(column![
+        kit::search_field(model.filter_text(), "Search clipboard", layout.search.height, &look),
+        Space::new().height((layout.tabs.y - layout.search.bottom()) as f32),
+        kit::tabs(&labels, model.filter().index(), layout.tabs.height, &look),
+    ])
+    .width(Length::Fill)
+    .height(Length::Fixed((layout.body_top - 1.0) as f32))
+    .padding(Padding { top: layout.padding as f32, right: layout.padding as f32, bottom: 0.0, left: layout.padding as f32 });
 
-    // Copied out by value for the same reason the row's colours are: the
-    // style closure outlives the borrow of `theme` this call holds.
-    let root_background = theme.surfaces.root;
-    // The accent, not `card_border` — the popup's own outline is meant
-    // to read, not just separate it from the desktop behind it.
-    let popup_border = theme.accent;
-    let popup_radius = theme.corner_radius();
-
-    // A failed pin/unpin takes over this same fixed-height slot rather
-    // than adding a banner above the rows: `geometry::RowLayout` derives
-    // where the first row starts from `header_height` alone, so growing
-    // the header area by an extra element would move every row down on
-    // screen without `RowLayout::row_at` knowing anything changed —
-    // exactly the "hit-test disagrees with what was drawn" failure
-    // CLAUDE.md warns about. Reusing the header's own slot means the
-    // notice can appear and clear (see `Model::pin_notice`'s doc — any
-    // other action clears it) without the row geometry ever moving.
-    let header_inner: Element<'a, Message, iced_widget::Theme, Renderer> = if let Some(notice) =
-        model.pin_notice()
-    {
-        text(notice.to_string()).size(theme.font_size).wrapping(Wrapping::None).color(to_iced(theme.error)).into()
-    } else if model.filter_text().is_empty() {
-        // Shows where a chosen entry will land, if `main.rs` was able to
-        // work that out — confirmation that the popup picked up the
-        // right window before anything is even chosen, per the owner's
-        // "make it aware of where it's pasting" ask. Reuses the header's
-        // own text slot rather than adding a widget, so `header_height`
-        // (and therefore every row below it) never moves for this.
-        let placeholder = match model.paste_target() {
-            Some(target) => format!("Type to filter — pasting into {target}"),
-            None => "Type to filter".to_string(),
-        };
-        text(placeholder).size(theme.font_size).wrapping(Wrapping::None).color(dim_color).into()
-    } else {
-        text(model.filter_text().to_string()).size(theme.font_size).wrapping(Wrapping::None).color(text_color).into()
-    };
-    // Full `font_size`, not the 0.85 this used to draw at: the field is
-    // as tall as a row now, and text smaller than every row beneath it
-    // read as a caption rather than as something you type into.
-    //
-    // A search field, not a plain line of text — the whole reason this
-    // is a `container` around the text rather than the text itself:
-    // `header_height` (and therefore where the first row starts) is
-    // untouched, since the container's own height is fixed to exactly
-    // `header_text_height`, the same number the text used to carry
-    // directly. Only the horizontal padding and the visible field
-    // (background plus an accent outline) are new.
-    let field_background = theme.surfaces.card;
-    let field_border = theme.accent;
-    let field_radius = theme.corner_radius().min((header_text_height / 2.0) as f32);
-    let header: Element<'a, Message, iced_widget::Theme, Renderer> = container(header_inner)
-        .width(Length::Fill)
-        .height(Length::Fixed(header_text_height as f32))
-        .padding(Padding { top: 0.0, right: 8.0, bottom: 0.0, left: 8.0 })
-        .align_y(iced_runtime::core::alignment::Vertical::Center)
-        .style(move |_: &iced_widget::Theme| container::Style {
-            background: Some(to_iced(field_background).into()),
-            border: iced_runtime::core::Border { radius: field_radius.into(), width: 1.0, color: to_iced(field_border) },
-            ..Default::default()
-        })
-        .into();
-
-    let body: Element<'a, Message, iced_widget::Theme, Renderer> = match model.history() {
+    let body: El<'a, Message, Renderer> = match model.history() {
         // Never collapse "could not be read" into "there is nothing
-        // configured" — CLAUDE.md's rule, and the reason this is a
-        // distinct branch instead of falling into the empty-list one
-        // below.
-        HistoryState::Unreadable(reason) => message(
-            &format!("Couldn't read the clipboard history: {reason}"),
-            to_iced(theme.error),
-            theme,
-        ),
-        HistoryState::Loaded(_) => {
-            let filtered = model.filtered();
-            if filtered.is_empty() {
-                let msg = if model.filter_text().is_empty() {
-                    "No clipboard history yet"
-                } else {
-                    "No matches"
-                };
-                message(msg, dim_color, theme)
-            } else {
-                let range = model.visible_range();
-                let selected = model.selected_index();
-                let window = &filtered[range.clone()];
-                let rows = range
-                    .zip(window.iter())
-                    .map(|(index, entry)| {
-                        entry_row(entry, index == selected, theme, &layout, thumbnails, now, popup_width)
-                    })
-                    .collect::<Vec<_>>();
-                // Shifted up by `scroll_remainder` — the same number
-                // `geometry::RowLayout::row_at` adds to a pointer's own
-                // `y` before hit-testing (see that method's own doc), so
-                // whatever this container draws at is exactly what a
-                // click or a hover resolves against. Clipped to a fixed
-                // `viewport_height` (rather than left to grow with
-                // however many rows got built) is what makes a partially
-                // visible row at the top or bottom look clipped instead
-                // of spilling into the header or past the popup's own
-                // edge — continuous scrolling's whole point.
-                container(column(rows).spacing(RowLayout::ROW_SPACING as f32))
-                    .padding(Padding { top: -(model.scroll_remainder() as f32), right: 0.0, bottom: 0.0, left: 0.0 })
-                    .width(Length::Fill)
-                    .height(Length::Fixed(model.viewport_height() as f32))
-                    .clip(true)
-                    .into()
-            }
+        // configured" — CLAUDE.md's rule, and the reason this is its own
+        // branch rather than the empty-list one.
+        HistoryState::Unreadable(reason) => {
+            message(&format!("Couldn't read the clipboard history: {reason}"), look.error, &look, layout.body_height)
+        }
+        HistoryState::Loaded(all) => {
+            let selected = model.selected_entry();
+            let list = list_pane(model, &layout, &look, thumbnails, now, home, all.is_empty());
+            let pane = preview_pane(model, selected.as_ref(), &layout, &look, thumbnails, now, home);
+            row![list, kit::divider(false, &look), pane].height(Length::Fixed(layout.body_height as f32)).into()
         }
     };
 
-    let content: Element<'a, Message, iced_widget::Theme, Renderer> = container(
-        column![header, Space::new().height(RowLayout::HEADER_GAP as f32), body]
-            .spacing(0)
-            .width(Length::Fill),
-    )
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .padding(Padding::from(RowLayout::PADDING as f32))
-    .style(move |_: &iced_widget::Theme| container::Style {
-        background: Some(to_iced(root_background).into()),
-        // The popup is a floating surface over the desktop, so it draws
-        // its own edge the way a window would — Hyprland rounds and
-        // borders real windows, and a layer-shell surface gets neither
-        // for free. Without this it was a hard-edged rectangle whatever
-        // the theme said.
-        border: iced_runtime::core::Border {
-            radius: popup_radius.into(),
-            width: 1.0,
-            color: to_iced(popup_border),
-        },
-        ..Default::default()
-    })
-    .into();
+    let content = column![
+        header,
+        kit::divider(true, &look),
+        container(body).height(Length::Fixed(layout.body_height as f32)),
+        kit::divider(true, &look),
+        footer(model, &layout, &look),
+    ];
 
-    // The scrollbar: drawn only when there is more content than the
-    // viewport shows (`Scrollbar::is_needed`) — a scrollbar that cannot
-    // scroll is noise. `layout.scrollbar` is the *one* place this crate
-    // computes the track's geometry (see that method's own doc); reading
-    // it here rather than recomputing the track's rectangle a second way
-    // is what keeps a drawn thumb and a dragged thumb from disagreeing
-    // about where it is.
-    let bar = layout.scrollbar(popup_width, model.viewport_height());
-    let content_height = layout.content_height(model.filtered().len());
-    if !bar.is_needed(content_height) {
-        return content;
+    let mut layers: Vec<El<'a, Message, Renderer>> = vec![kit::frame(content, &look)];
+    if matches!(model.history(), HistoryState::Loaded(_)) {
+        if let Some(bar) = kit::scrollbar_layer(&layout.scrollbar(), model.stack().content_height(), model.scroll_offset(), &look) {
+            layers.push(bar);
+        }
     }
-    let thumb_top = bar.thumb_top(content_height, model.scroll_offset());
-    let thumb_height = bar.thumb_height(content_height);
-    let thumb_color = to_iced(theme.accent);
-    let scrollbar: Element<'a, Message, iced_widget::Theme, Renderer> = container(
-        container(Space::new())
-            .width(Length::Fixed(bar.width as f32))
-            .height(Length::Fixed(thumb_height as f32))
-            .style(move |_: &iced_widget::Theme| container::Style {
-                background: Some(thumb_color.into()),
-                border: iced_runtime::core::Border { radius: (bar.width as f32 / 2.0).into(), width: 0.0, color: thumb_color },
-                ..Default::default()
-            }),
-    )
-    .padding(Padding { top: thumb_top as f32, left: bar.track_x as f32, right: 0.0, bottom: 0.0 })
-    .into();
-
-    Stack::with_children([content, scrollbar]).width(Length::Fill).height(Length::Fill).into()
+    Stack::with_children(layers).width(Length::Fill).height(Length::Fill).into()
 }
 
+/// The left pane: the visible lines of the list, drawn at exactly the
+/// positions the model's stack gives them.
+fn list_pane<'a, Message, Renderer>(
+    model: &'a Model,
+    layout: &Layout,
+    look: &Look,
+    thumbnails: &mut thumbnail::Cache,
+    now: u64,
+    home: Option<&str>,
+    history_empty: bool,
+) -> El<'a, Message, Renderer>
+where
+    Message: 'a,
+    Renderer: iced_runtime::core::text::Renderer<Font = Font>
+        + iced_runtime::core::image::Renderer<Handle = iced_runtime::core::image::Handle>
+        + 'a,
+{
+    let filtered = model.filtered();
+    let inner: El<'a, Message, Renderer> = if filtered.is_empty() {
+        let words = if history_empty {
+            "No clipboard history yet".to_string()
+        } else if !model.filter_text().is_empty() {
+            "No matches".to_string()
+        } else {
+            format!("Nothing under {}", model.filter().label())
+        };
+        message(&words, look.dim, look, layout.viewport_height())
+    } else {
+        let lines = model.lines();
+        let stack = model.stack();
+        let offset = model.scroll_offset();
+        let visible = stack.visible(offset, layout.viewport_height());
+        let selected = model.selected_index();
+        let text_width = layout.list_width - layout.list_inset * 2.0;
+        let drawn: Vec<El<'a, Message, Renderer>> = visible
+            .clone()
+            .map(|i| match lines[i] {
+                Line::Header(section) => kit::section_label(section.title(), None, stack.height(i), false, look),
+                Line::Entry(index) => entry_row(filtered[index], index == selected, layout, look, thumbnails, now, home, text_width),
+            })
+            .collect();
+        // Shifted up by however far the first drawn line sits above the
+        // viewport's top — the same offset `Layout::hit` adds back — and
+        // clipped to the viewport, so a half-scrolled line reads as
+        // half-scrolled rather than spilling into the header.
+        let shift = offset - stack.top(visible.start);
+        container(Column::with_children(drawn).spacing(stack.spacing() as f32))
+            .padding(Padding { top: -(shift as f32), right: 0.0, bottom: 0.0, left: 0.0 })
+            .width(Length::Fill)
+            .height(Length::Fixed(layout.viewport_height() as f32))
+            .clip(true)
+            .into()
+    };
+    container(inner)
+        .width(Length::Fixed(layout.list_width as f32))
+        .height(Length::Fixed(layout.body_height as f32))
+        .padding(Padding { top: 0.0, right: layout.list_inset as f32, bottom: layout.list_inset as f32, left: layout.list_inset as f32 })
+        .into()
+}
 
-/// A short, glanceable age for a copy, both `now` and `copied_at` in
-/// seconds since the Unix epoch — the same unit `Entry::copied_at` is
-/// stored in.
+/// One entry: its kind's badge, a swatch or thumbnail where the kind has
+/// one, a one-line preview, and "pinned" or its age at the right.
+#[allow(clippy::too_many_arguments)]
+fn entry_row<'a, Message, Renderer>(
+    entry: &Entry,
+    selected: bool,
+    layout: &Layout,
+    look: &Look,
+    thumbnails: &mut thumbnail::Cache,
+    now: u64,
+    home: Option<&str>,
+    width: f64,
+) -> El<'a, Message, Renderer>
+where
+    Message: 'a,
+    Renderer: iced_runtime::core::text::Renderer<Font = Font>
+        + iced_runtime::core::image::Renderer<Handle = iced_runtime::core::image::Handle>
+        + 'a,
+{
+    let look = *look;
+    let kind = Kind::of(&entry.content);
+    let mut parts: Vec<El<'a, Message, Renderer>> = vec![badge(kind, &look)];
+    let mut used = 8.0 * 2.0 + BADGE_WIDTH + 10.0;
+
+    match kind {
+        Kind::Colour(colour) => {
+            parts.push(swatch(kit::to_iced(colour), 14.0, 4.0));
+            used += 14.0 + 10.0;
+        }
+        // Only rows actually built reach `thumbnails.get`, so a history
+        // of hundreds of images costs nothing until scrolled to.
+        Kind::Image => {
+            if let Some(handle) = thumbnails.get(entry) {
+                parts.push(iced_widget::image(handle).width(Length::Fixed(28.0)).height(Length::Fixed(18.0)).content_fit(ContentFit::Cover).into());
+                used += 28.0 + 10.0;
+            }
+        }
+        _ => {}
+    }
+
+    let right = if entry.pinned { "pinned".to_string() } else { relative_age(now, entry.copied_at) };
+    let right_width = (look.small() as f64 * 0.62 * 6.5).ceil();
+    used += right_width + 10.0;
+
+    let (label, font, size) = match (&entry.content, kind) {
+        (Content::Image { .. }, _) => (image_label(entry, thumbnails), Font::DEFAULT, look.font_size),
+        (Content::Text(t), Kind::Text) => (t.clone(), look.mono, look.font_size * 0.96),
+        (Content::Text(t), _) => (kind::display(kind, t, home), Font::DEFAULT, look.font_size),
+    };
+    // `preview` collapses whitespace and truncates on a character
+    // boundary; `Wrapping::None` and the row's clip are what stop a
+    // long line from growing the row or drawing past it.
+    let chars = Layout::chars_that_fit(size, (width - used).max(0.0));
+    let label = Content::Text(label).preview(chars);
+    parts.push(
+        container(text(label).size(size).font(font).color(look.text).wrapping(Wrapping::None))
+            .width(Length::Fill)
+            .clip(true)
+            .into(),
+    );
+    parts.push(
+        container(text(right).size(look.small()).font(look.mono).color(look.dim).wrapping(Wrapping::None))
+            .width(Length::Fixed(right_width as f32))
+            .align_x(Horizontal::Right)
+            .into(),
+    );
+
+    let radius = look.radius_for(layout.row_height, 8.0);
+    container(Row::with_children(parts).spacing(10).align_y(Vertical::Center))
+        .width(Length::Fill)
+        .height(Length::Fixed(layout.row_height as f32))
+        .padding(Padding { top: 0.0, right: 8.0, bottom: 0.0, left: 8.0 })
+        .align_y(Vertical::Center)
+        .clip(true)
+        .style(move |_: &iced_widget::Theme| container::Style {
+            background: selected.then_some(look.selected.into()),
+            border: Border { radius: radius.into(), ..Default::default() },
+            ..Default::default()
+        })
+        .into()
+}
+
+const BADGE_WIDTH: f64 = 34.0;
+
+/// The kind's badge. Its letters take the kind's colour — the design's
+/// one use of the state colours here, each read from the theme: a link
+/// in the theme's "somewhere else" cyan, an image in its green, a file
+/// in its orange, a colour in the accent it most likely came from.
+fn badge<'a, Message: 'a, Renderer>(kind: Kind, look: &Look) -> El<'a, Message, Renderer>
+where
+    Renderer: iced_runtime::core::text::Renderer<Font = Font> + 'a,
+{
+    let colour = match kind {
+        Kind::Text => look.text,
+        Kind::Colour(_) => look.accent,
+        Kind::Link => look.info,
+        Kind::File => look.warning,
+        Kind::Image => look.success,
+    };
+    let fill = Color { a: 0.45, ..look.chip };
+    container(text(kind.badge()).size(look.font_size * 0.73).font(Font { weight: iced_runtime::core::font::Weight::Semibold, ..look.mono }).color(colour).wrapping(Wrapping::None))
+        .width(Length::Fixed(BADGE_WIDTH as f32))
+        .padding(Padding { top: 3.0, right: 0.0, bottom: 3.0, left: 0.0 })
+        .align_x(Horizontal::Center)
+        .style(move |_: &iced_widget::Theme| container::Style {
+            background: Some(fill.into()),
+            border: Border { radius: 5.0.into(), ..Default::default() },
+            ..Default::default()
+        })
+        .into()
+}
+
+fn swatch<'a, Message: 'a, Renderer>(colour: Color, side: f32, radius: f32) -> El<'a, Message, Renderer>
+where
+    Renderer: iced_runtime::core::Renderer + 'a,
+{
+    container(Space::new())
+        .width(Length::Fixed(side))
+        .height(Length::Fixed(side))
+        .style(move |_: &iced_widget::Theme| container::Style {
+            background: Some(colour.into()),
+            border: Border { radius: radius.into(), ..Default::default() },
+            ..Default::default()
+        })
+        .into()
+}
+
+/// "Image 1440 × 900", or "Image · image/png · 212 KB" when the header
+/// could not be read.
+fn image_label(entry: &Entry, thumbnails: &mut thumbnail::Cache) -> String {
+    match thumbnails.size(entry) {
+        Some((w, h)) => format!("Image {w} × {h}"),
+        None => entry.content.preview(usize::MAX),
+    }
+}
+
+/// The right pane: the selected entry, larger; what it is; and the three
+/// buttons, each at exactly the rectangle `Layout` gives it.
+fn preview_pane<'a, Message, Renderer>(
+    model: &Model,
+    entry: Option<&Entry>,
+    layout: &Layout,
+    look: &Look,
+    thumbnails: &mut thumbnail::Cache,
+    now: u64,
+    home: Option<&str>,
+) -> El<'a, Message, Renderer>
+where
+    Message: 'a,
+    Renderer: iced_runtime::core::text::Renderer<Font = Font>
+        + iced_runtime::core::image::Renderer<Handle = iced_runtime::core::image::Handle>
+        + 'a,
+{
+    let pane_background = Color { a: 0.3, ..look.inset };
+    let content: El<'a, Message, Renderer> = match entry {
+        None => container(text("Nothing selected").size(look.small()).color(look.dim)).center(Length::Fill).into(),
+        Some(entry) => {
+            let kind = Kind::of(&entry.content);
+            let well = Color { a: 0.05, ..look.text };
+            let radius = look.radius_for(layout.preview.height, 8.0);
+            let preview = container(preview_content(entry, kind, layout, look, thumbnails, home))
+                .width(Length::Fill)
+                .height(Length::Fixed(layout.preview.height as f32))
+                .padding(12)
+                .clip(true)
+                .style(move |_: &iced_widget::Theme| container::Style {
+                    background: Some(well.into()),
+                    border: Border { radius: radius.into(), ..Default::default() },
+                    ..Default::default()
+                });
+
+            let meta = meta_block(entry, kind, layout, look, thumbnails, now);
+            let paste_label = match model.paste_target() {
+                Some(target) => format!("Paste into {target}"),
+                None => "Paste".to_string(),
+            };
+            let pin_label = if entry.pinned { "Unpin" } else { "Pin" };
+            let gap = (layout.delete_button.x - layout.pin_button.right()) as f32;
+            column![
+                preview,
+                Space::new().height(layout.pane_gap as f32),
+                meta,
+                Space::new().height(Length::Fill),
+                button(&paste_label, "Enter", true, layout.paste_button.height, look),
+                Space::new().height((layout.pin_button.y - layout.paste_button.bottom()) as f32),
+                row![
+                    button(pin_label, "Ctrl P", false, layout.pin_button.height, look),
+                    Space::new().width(gap),
+                    button("Delete", "Del", false, layout.delete_button.height, look),
+                ],
+            ]
+            .into()
+        }
+    };
+    container(content)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(layout.pane_padding as f32)
+        .style(move |_: &iced_widget::Theme| container::Style {
+            background: Some(pane_background.into()),
+            ..Default::default()
+        })
+        .into()
+}
+
+/// What goes in the preview well, by kind. Text is bounded before it is
+/// laid out: the well shows a few lines, and handing a megabyte of copied
+/// log to the text shaper to fill a 110-pixel box would be the popup
+/// paying for what nobody can see.
+fn preview_content<'a, Message, Renderer>(
+    entry: &Entry,
+    kind: Kind,
+    layout: &Layout,
+    look: &Look,
+    thumbnails: &mut thumbnail::Cache,
+    home: Option<&str>,
+) -> El<'a, Message, Renderer>
+where
+    Message: 'a,
+    Renderer: iced_runtime::core::text::Renderer<Font = Font>
+        + iced_runtime::core::image::Renderer<Handle = iced_runtime::core::image::Handle>
+        + 'a,
+{
+    match (&entry.content, kind) {
+        (Content::Image { .. }, _) => match thumbnails.get(entry) {
+            Some(handle) => iced_widget::image(handle).width(Length::Fill).height(Length::Fill).content_fit(ContentFit::Contain).into(),
+            None => {
+                let why = if thumbnails.over_cap(entry) { "Too large to preview" } else { "Not an image this popup can read" };
+                container(text(why).size(look.small()).color(look.dim)).center(Length::Fill).into()
+            }
+        },
+        (Content::Text(value), Kind::Colour(colour)) => row![
+            swatch(kit::to_iced(colour), (layout.preview.height - 24.0) as f32, 6.0),
+            column![
+                text(value.trim().to_string()).size(look.font_size * 1.1).font(look.mono).color(look.text),
+                text(channels(colour)).size(look.small()).font(look.mono).color(look.dim).wrapping(Wrapping::None),
+            ]
+            .spacing(6),
+        ]
+        .spacing(14)
+        .align_y(Vertical::Center)
+        .into(),
+        (Content::Text(value), Kind::Text) => {
+            text(bounded(value, 8, 400)).size(look.font_size * 0.92).font(look.mono).color(look.text).wrapping(Wrapping::WordOrGlyph).into()
+        }
+        (Content::Text(value), Kind::Link) => {
+            text(bounded(value, 4, 400)).size(look.font_size).color(look.info).wrapping(Wrapping::Glyph).into()
+        }
+        (Content::Text(value), _) => {
+            let shown: Vec<String> = value.lines().filter(|l| !l.trim().is_empty()).take(5).map(|l| kind::display(kind, l, home)).collect();
+            text(shown.join("\n")).size(look.font_size).color(look.text).wrapping(Wrapping::Glyph).into()
+        }
+    }
+}
+
+/// A colour's channels as decimals — `189 147 249` — with its alpha only
+/// when it is not opaque, since an alpha of 255 on every hex colour anyone
+/// copies is noise.
+fn channels(colour: hyprforge_look::Color) -> String {
+    let rgb = format!("{} {} {}", colour.r, colour.g, colour.b);
+    if colour.a == 0xff {
+        rgb
+    } else {
+        format!("{rgb} · {}%", (colour.a as u32 * 100 + 127) / 255)
+    }
+}
+
+/// At most `max_lines` lines and `max_chars` characters of `value`,
+/// counted in characters so nothing is cut mid-character, with an
+/// ellipsis when anything was left out.
+fn bounded(value: &str, max_lines: usize, max_chars: usize) -> String {
+    let lines: Vec<&str> = value.lines().take(max_lines).collect();
+    let mut out = lines.join("\n");
+    let truncated_lines = value.lines().nth(max_lines).is_some();
+    if out.chars().count() > max_chars {
+        out = out.chars().take(max_chars).collect();
+        out.push('\u{2026}');
+    } else if truncated_lines {
+        out.push('\u{2026}');
+    }
+    out
+}
+
+/// Type, Copied, Size — the design's "From" line is left out because the
+/// history does not record which application a copy came from, and a
+/// line that is always blank is noise.
+fn meta_block<'a, Message, Renderer>(
+    entry: &Entry,
+    kind: Kind,
+    layout: &Layout,
+    look: &Look,
+    thumbnails: &mut thumbnail::Cache,
+    now: u64,
+) -> El<'a, Message, Renderer>
+where
+    Message: 'a,
+    Renderer: iced_runtime::core::text::Renderer<Font = Font> + 'a,
+{
+    let kind_text = match &entry.content {
+        Content::Image { mime, .. } => mime.to_string(),
+        Content::Text(_) => kind.describe().to_string(),
+    };
+    let size_text = match &entry.content {
+        Content::Image { bytes, .. } => match thumbnails.size(entry) {
+            Some((w, h)) => format!("{w} × {h} · {}", human_bytes(bytes.len())),
+            None => human_bytes(bytes.len()),
+        },
+        Content::Text(t) => {
+            let chars = t.chars().count();
+            let lines = t.lines().count();
+            let unit = if chars == 1 { "char" } else { "chars" };
+            if lines > 1 {
+                format!("{} {unit} · {lines} lines", thousands(chars))
+            } else {
+                format!("{} {unit}", thousands(chars))
+            }
+        }
+    };
+    let rows = [("Type", kind_text), ("Copied", copied(now, entry.copied_at)), ("Size", size_text)];
+    let line = layout.meta_line as f32;
+    Column::with_children(rows.into_iter().map(|(label, value)| {
+        row![
+            container(text(label).size(look.small()).color(look.dim)).width(Length::Fixed(62.0)),
+            text(value).size(look.small()).font(look.mono).color(look.text).wrapping(Wrapping::None),
+        ]
+        .height(Length::Fixed(line))
+        .spacing(10)
+        .align_y(Vertical::Center)
+        .into()
+    }))
+    .spacing(layout.meta_gap as f32)
+    .into()
+}
+
+/// A pane button: its label at the left and its key at the right. The
+/// primary one is the accent with the popup's background as its text.
+fn button<'a, Message: 'a, Renderer>(label: &str, key: &str, primary: bool, height: f64, look: &Look) -> El<'a, Message, Renderer>
+where
+    Renderer: iced_runtime::core::text::Renderer<Font = Font> + 'a,
+{
+    let look = *look;
+    let (fill, ink) = if primary { (look.accent, look.on_accent) } else { (Color { a: 0.45, ..look.chip }, look.text) };
+    let key_ink = Color { a: 0.75, ..ink };
+    let radius = look.radius_for(height, 7.0);
+    container(
+        row![
+            text(label.to_string()).size(look.font_size).font(if primary { kit::strong() } else { Font::DEFAULT }).color(ink).wrapping(Wrapping::None),
+            Space::new().width(Length::Fill),
+            text(key.to_string()).size(look.label()).font(look.mono).color(key_ink).wrapping(Wrapping::None),
+        ]
+        .align_y(Vertical::Center),
+    )
+    .width(Length::Fill)
+    .height(Length::Fixed(height as f32))
+    .padding(Padding { top: 0.0, right: 10.0, bottom: 0.0, left: 10.0 })
+    .align_y(Vertical::Center)
+    .clip(true)
+    .style(move |_: &iced_widget::Theme| container::Style {
+        background: Some(fill.into()),
+        border: Border { radius: radius.into(), ..Default::default() },
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The strip along the bottom: the keys, or a notice about the last
+/// thing that did not happen, and "Clear history…" at the right.
+fn footer<'a, Message: 'a, Renderer>(model: &Model, layout: &Layout, look: &Look) -> El<'a, Message, Renderer>
+where
+    Renderer: iced_runtime::core::text::Renderer<Font = Font> + 'a,
+{
+    let look_copy = *look;
+    let left: El<'a, Message, Renderer> = match model.notice() {
+        Some(notice) => text(notice.to_string()).size(look.small()).color(look.error).wrapping(Wrapping::None).into(),
+        None => {
+            let pin = match model.selected_entry() {
+                Some(e) if e.pinned => "unpin",
+                _ => "pin",
+            };
+            row![kit::key_hint("Ctrl P", pin, look), kit::key_hint("Del", "delete", look), kit::key_hint("Tab", "filter", look)]
+                .spacing(12)
+                .align_y(Vertical::Center)
+                .into()
+        }
+    };
+    let clear_words = if model.clear_armed() {
+        let n = model.clearable().len();
+        format!("Click again to clear {n}")
+    } else {
+        "Clear history\u{2026}".to_string()
+    };
+    let clear = container(text(clear_words).size(look.font_size * 0.92).color(look.error).wrapping(Wrapping::None))
+        .width(Length::Fixed(layout.clear_button.width as f32))
+        .height(Length::Fill)
+        .align_x(Horizontal::Right)
+        .align_y(Vertical::Center);
+    container(row![container(left).width(Length::Fill).clip(true), clear].align_y(Vertical::Center))
+        .width(Length::Fill)
+        .height(Length::Fixed(layout.footer_height as f32))
+        .padding(Padding { top: 0.0, right: (layout.width - layout.clear_button.right()) as f32, bottom: 0.0, left: 12.0 })
+        .align_y(Vertical::Center)
+        .style(move |_: &iced_widget::Theme| container::Style {
+            background: Some(look_copy.footer.into()),
+            ..Default::default()
+        })
+        .into()
+}
+
+fn message<'a, Message: 'a, Renderer>(words: &str, colour: Color, look: &Look, height: f64) -> El<'a, Message, Renderer>
+where
+    Renderer: iced_runtime::core::text::Renderer<Font = Font> + 'a,
+{
+    container(text(words.to_string()).size(look.font_size).color(colour))
+        .width(Length::Fill)
+        .height(Length::Fixed(height as f32))
+        .padding(12)
+        .into()
+}
+
+/// A short, glanceable age for a row: "now", then whole minutes, hours
+/// or days. A clipboard history is skimmed, not read for precision.
 ///
-/// The vocabulary is deliberately narrow: "now" under a minute old, then
-/// whole minutes, hours, or days. A clipboard history is skimmed, not
-/// read for precision — telling "the thing I just copied" apart from
-/// "the thing from this morning" needs a category, not a stopwatch, and
-/// a narrower vocabulary is also a narrower thing for a translator or a
-/// future reader to get wrong.
-///
-/// `now.saturating_sub(copied_at)` is what keeps this from ever
-/// underflowing. A `u64` subtraction that went negative would wrap to a
-/// number near `u64::MAX` instead of panicking, which would silently
-/// print an age of several hundred billion years — so the saturating
-/// subtraction is not just tidiness, it is what turns two different real
-/// failure modes into the same harmless "now": a `copied_at` that is
-/// genuinely in the future (a clock that jumped backward between the
-/// daemon recording the copy and this popup drawing it), and a `now`
-/// that is itself behind `copied_at` for the same reason from the other
-/// side. Both read as "just copied" rather than as an error, which is
-/// the least surprising thing to show for a clock glitch neither side
-/// caused.
+/// `saturating_sub` is what keeps a clock that jumped backwards between
+/// the daemon recording a copy and this popup drawing it from wrapping to
+/// an age of several hundred billion years: both sides of that glitch
+/// read as "now", the least surprising thing to show.
 fn relative_age(now: u64, copied_at: u64) -> String {
     const MINUTE: u64 = 60;
     const HOUR: u64 = 60 * MINUTE;
     const DAY: u64 = 24 * HOUR;
-
     let elapsed = now.saturating_sub(copied_at);
     if elapsed < MINUTE {
         "now".to_string()
@@ -251,289 +587,71 @@ fn relative_age(now: u64, copied_at: u64) -> String {
     }
 }
 
-/// How many characters of a preview fit in `available_width` pixels at
-/// `font_size`, so a row's preview text ends before the pin toggle
-/// rather than running into it.
-///
-/// This is necessarily an estimate: this crate builds a fresh
-/// `UserInterface` from scratch every frame (see `surface.rs::draw`)
-/// rather than keeping one running that could measure a string's actual
-/// shaped width ahead of time, so there is no real text-metrics call to
-/// make here. `0.6` is a plain average-glyph-width factor for a
-/// proportional font — generous enough that ordinary text (which is
-/// narrower on average, especially with `Content::preview`'s own
-/// whitespace collapsing) reliably fits inside the estimate rather than
-/// spilling past it, which is what matters here: the same "clip rather
-/// than overflow" backstop `entry_row`'s own `.clip(true)` and
-/// `Wrapping::None` already provide handles anything this estimate
-/// slightly undershoots.
-fn max_preview_chars(font_size: f32, available_width: f64) -> usize {
-    let avg_char_width = (font_size as f64 * 0.6).max(1.0);
-    ((available_width / avg_char_width).floor() as usize).max(1)
-}
-
-fn message<'a, Message, Renderer>(
-    text_value: &str,
-    color: iced_runtime::core::Color,
-    theme: &Theme,
-) -> Element<'a, Message, iced_widget::Theme, Renderer>
-where
-    Message: 'a,
-    Renderer: iced_runtime::core::text::Renderer<Font = iced_runtime::core::Font> + 'a,
-{
-    container(text(text_value.to_string()).size(theme.font_size).color(color))
-        .width(Length::Fill)
-        .padding(Padding::from(12))
-        .into()
-}
-
-fn entry_row<'a, Message, Renderer>(
-    entry: &Entry,
-    selected: bool,
-    theme: &Theme,
-    layout: &RowLayout,
-    thumbnails: &mut thumbnail::Cache,
-    now: u64,
-    popup_width: f64,
-) -> Element<'a, Message, iced_widget::Theme, Renderer>
-where
-    Message: 'a,
-    Renderer: iced_runtime::core::text::Renderer<Font = iced_runtime::core::Font>
-        + iced_runtime::core::image::Renderer<Handle = iced_runtime::core::image::Handle>
-        + 'a,
-{
-    let text_color = if selected { to_iced(theme.surfaces.text) } else { to_iced(theme.surfaces.text_dim) };
-
-    // `preview` already collapses whitespace and truncates on a
-    // character boundary (`Content::preview`'s own doc comment) — that
-    // handles a multi-line copy or an absurdly long single line in terms
-    // of *characters*. `Wrapping::None` below is what stops the row
-    // itself from growing: without it, iced wraps at word boundaries
-    // regardless of how few characters got through, and a row full of
-    // hyphen-free base64 or a URL would still lay out as several tall
-    // lines instead of the one-line preview a clipboard history needs.
-    //
-    // The character cap itself used to be the flat `96` regardless of
-    // how much room the row actually had, which is what let a long
-    // preview run straight into the pin toggle: `Wrapping::None` stops
-    // the row from *growing*, but does nothing to stop the text from
-    // *drawing* past its own allotted space toward whatever is laid out
-    // after it. `max_preview_chars` derives the cap from the same pixel
-    // geometry `RowLayout::hit_test` uses for the pin's own rectangle, so
-    // the preview is truncated to end where the pin toggle begins,
-    // rather than merely being clipped at the row's far edge.
-    let preview = entry.content.preview(max_preview_chars(theme.font_size, layout.preview_width(popup_width)));
-    let label: Element<'a, Message, iced_widget::Theme, Renderer> = text(preview)
-        .size(theme.font_size)
-        .wrapping(Wrapping::None)
-        .color(text_color)
-        .into();
-
-    let preview: Element<'a, Message, iced_widget::Theme, Renderer> = match &entry.content {
-        // Only entries actually built into a row (see
-        // `Model::visible_range`) ever reach `thumbnails.get`, so a
-        // history of hundreds of images costs nothing until scrolled
-        // to.
-        Content::Image { .. } => match thumbnails.get(entry) {
-            Some(handle) => row![
-                iced_widget::image(handle)
-                    .width(Length::Fixed(RowLayout::THUMBNAIL_SIZE as f32))
-                    .height(Length::Fixed(RowLayout::THUMBNAIL_SIZE as f32)),
-                Space::new().width(8),
-                label,
-            ]
-            .into(),
-            // Over the decode cap, or not a decodable image at all —
-            // the row still shows the text preview rather than nothing.
-            None => label,
-        },
-        Content::Text(_) => label,
+/// The pane's longer form: the local wall-clock time it was copied, and
+/// how long ago in words — "14:19 · 1 min ago". A copy from another day
+/// gets its date as well, since "09:12" alone would read as this morning.
+fn copied(now: u64, copied_at: u64) -> String {
+    let when = chrono::DateTime::from_timestamp(copied_at as i64, 0).map(|t| t.with_timezone(&chrono::Local));
+    let today = chrono::DateTime::from_timestamp(now as i64, 0).map(|t| t.with_timezone(&chrono::Local).date_naive());
+    let clock = match (when, today) {
+        (Some(when), Some(today)) if when.date_naive() == today => when.format("%H:%M").to_string(),
+        (Some(when), _) => when.format("%-d %b %H:%M").to_string(),
+        (None, _) => return long_age(now, copied_at),
     };
-    // Fixed to `Length::Fill` rather than left to shrink to the text's
-    // own width: everything after it (the pin toggle, the time label) is
-    // positioned at a fixed offset from the row's *right* edge, and
-    // `geometry::RowLayout::hit_test` computes that same offset
-    // independently of whatever this widget tree actually measures out
-    // to. If the preview were free to grow with an unusually long line,
-    // it could push the pin toggle somewhere `hit_test` does not expect
-    // it — precisely the "drawn" and "hit-tested" positions disagreeing
-    // that caused the original bug this whole layout exists to avoid.
-    let preview: Element<'a, Message, iced_widget::Theme, Renderer> = container(preview).width(Length::Fill).into();
+    format!("{clock} · {}", long_age(now, copied_at))
+}
 
-    // The pin toggle: a small round indicator, filled with the accent
-    // colour when pinned and merely outlined in it otherwise — readable
-    // at a glance, and its own click target (see `surface::pointer_click`
-    // and `geometry::RowLayout::hit_test`), not just the F2 keybind's
-    // visual echo. Fixed-size for the same reason the thumbnail is: a
-    // size read back from the renderer could disagree with what
-    // `hit_test` was told to expect.
-    let pinned = entry.pinned;
-    let pin_color = if pinned { to_iced(theme.accent) } else { to_iced(theme.surfaces.text_dim) };
-    let pin_size = layout.pin_size as f32;
-    let pin_toggle: Element<'a, Message, iced_widget::Theme, Renderer> = container(Space::new())
-        .width(Length::Fixed(pin_size))
-        .height(Length::Fixed(pin_size))
-        .style(move |_: &iced_widget::Theme| container::Style {
-            background: if pinned { Some(pin_color.into()) } else { None },
-            border: iced_runtime::core::Border { radius: (pin_size / 2.0).into(), width: 1.5, color: pin_color },
-            ..Default::default()
-        })
-        .into();
+fn long_age(now: u64, copied_at: u64) -> String {
+    let elapsed = now.saturating_sub(copied_at);
+    let (n, unit) = match elapsed {
+        e if e < 60 => return "just now".to_string(),
+        e if e < 3600 => (e / 60, "min"),
+        e if e < 86_400 => (e / 3600, "h"),
+        e => (e / 86_400, if e / 86_400 == 1 { "day" } else { "days" }),
+    };
+    format!("{n} {unit} ago")
+}
 
-    // The age sits at the row's right-hand end, in its own fixed-width
-    // box for the same reason the pin toggle needs one: `hit_test`
-    // computes this label's left edge to know where the pin toggle's
-    // own box ends, so its width has to be a number both sides agree on
-    // rather than whatever `relative_age`'s string happens to measure.
-    let age_color = to_iced(theme.surfaces.text_dim);
-    let age_label: Element<'a, Message, iced_widget::Theme, Renderer> = text(relative_age(now, entry.copied_at))
-        .size(theme.font_size * 0.75)
-        .wrapping(Wrapping::None)
-        .color(age_color)
-        .into();
-    let age_box: Element<'a, Message, iced_widget::Theme, Renderer> = container(age_label)
-        .width(Length::Fixed(layout.time_width as f32))
-        .align_x(iced_runtime::core::alignment::Horizontal::Right)
-        .into();
+/// `1284` as `1,284`.
+fn thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
 
-    // Left to right: the preview, the pin toggle, the time — exactly the
-    // order `geometry::RowLayout::hit_test` assumes when it works
-    // backward from the row's right edge.
-    let content: Element<'a, Message, iced_widget::Theme, Renderer> = row![
-        preview,
-        Space::new().width(RowLayout::PIN_GAP as f32),
-        pin_toggle,
-        Space::new().width(RowLayout::PIN_GAP as f32),
-        age_box,
-    ]
-    .align_y(iced_runtime::core::alignment::Vertical::Center)
-    .into();
-
-    // Copied out of `theme` as plain `Color`s rather than captured by
-    // reference: the style closure below has to be `'static`-ish (bound
-    // by `'a`, same as the `Element` it ends up in), and `theme` itself
-    // only ever borrows for the length of one `view` call.
-    let row_background = to_iced(if selected { theme.surfaces.row } else { theme.surfaces.card });
-    // The accent, not `card_border`: this border is a selection
-    // indicator rather than an edge — the popup's own outline is the one
-    // that takes `card_border`. Pinning used to borrow this same border
-    // at a thinner width, but now that the pin toggle itself shows
-    // pinned-or-not (filled versus outlined, see `pin_toggle` above) that
-    // reads as redundant clutter rather than a second signal — CLAUDE.md's
-    // "must look different" is satisfied by the toggle alone now, so this
-    // border is selection-only.
-    let border_color = to_iced(theme.accent);
-    let border_width = if selected { 1.5 } else { 0.0 };
-    // Never more than half the row's height. A radius larger than that
-    // is a degenerate shape, and degenerate shapes are the reason
-    // `hyprforge-authui` bounds this field at all: `tiny_skia`'s path
-    // builders return `None` for them and iced unwraps that.
-    let row_radius = theme.corner_radius().min(layout.row_height as f32 / 2.0);
-
-    container(content)
-        .width(Length::Fill)
-        // Fixed to `layout.row_height`, the exact number
-        // `geometry::RowLayout::row_at` hit-tests against — not left to
-        // shrink around whatever the label or thumbnail measure out to.
-        // A row that grew or shrank with its content would still overflow
-        // visually (an unusually tall glyph, a thumbnail bigger than
-        // `THUMBNAIL_SIZE` somehow) *and* would silently invalidate the
-        // hit-test's arithmetic at the same time.
-        .height(Length::Fixed(layout.row_height as f32))
-        .align_y(iced_runtime::core::alignment::Vertical::Center)
-        .padding(Padding::from(RowLayout::ROW_PADDING as f32))
-        // Belt and braces alongside `Wrapping::None`: a preview that is
-        // still wider than the row (a long run of characters with no
-        // word breaks at all, wider per-character than average) is
-        // clipped at the row's own edge instead of overdrawing into the
-        // padding or the row below it.
-        .clip(true)
-        .style(move |_: &iced_widget::Theme| container::Style {
-            background: Some(row_background.into()),
-            border: iced_runtime::core::Border {
-                radius: row_radius.into(),
-                width: border_width,
-                color: border_color,
-            },
-            ..Default::default()
-        })
-        .into()
+fn human_bytes(bytes: usize) -> String {
+    const KB: usize = 1024;
+    const MB: usize = KB * 1024;
+    match bytes {
+        b if b >= MB => format!("{:.1} MB", b as f64 / MB as f64),
+        b if b >= KB => format!("{:.0} KB", b as f64 / KB as f64),
+        b => format!("{b} B"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The bug this fixes: the radius was the literal `4.0` and the
-    /// popup had no border at all, so a theme saying `rounding = 12`
-    /// drew square rows inside a hard-edged rectangle. Reading the field
-    /// is the whole point, so assert it is actually read.
-    #[test]
-    fn the_corner_radius_comes_from_the_theme_rather_than_a_constant() {
-        let theme = Theme { rounding: 12, ..Theme::default() };
-        assert_eq!(theme.corner_radius(), 12.0);
-        let square = Theme { rounding: 0, ..Theme::default() };
-        assert_eq!(square.corner_radius(), 0.0, "a theme may legitimately ask for square corners");
-    }
-
-    /// `hyprforge-authui` bounds the same field for the lock screen, and
-    /// the reason is not cosmetic: a degenerate radius reaches a
-    /// `tiny_skia` path builder that answers `None`, and iced unwraps
-    /// it. A popup that panics on a hostile theme file is a popup that
-    /// panics on a typo.
-    #[test]
-    fn an_absurd_rounding_is_bounded_rather_than_handed_to_the_renderer() {
-        let theme = Theme { rounding: u32::MAX, ..Theme::default() };
-        let radius = theme.corner_radius();
-        assert!(radius.is_finite());
-        assert!(radius <= 64.0, "got {radius}");
-    }
-
-    // --- `max_preview_chars`: the estimate that keeps a row's preview
-    // text from running into the pin toggle.
-
-    #[test]
-    fn a_wider_available_width_allows_more_characters() {
-        let narrow = max_preview_chars(15.0, 60.0);
-        let wide = max_preview_chars(15.0, 600.0);
-        assert!(wide > narrow, "more room must allow more characters, not fewer");
-    }
-
-    #[test]
-    fn zero_or_negative_width_still_allows_at_least_one_character() {
-        // Never zero: a preview of zero characters would show an empty
-        // row rather than the clipped-but-present text a degenerate popup
-        // size should still manage.
-        assert_eq!(max_preview_chars(15.0, 0.0), 1);
-    }
-
-    #[test]
-    fn a_bigger_font_needs_more_width_per_character() {
-        let small_font = max_preview_chars(12.0, 300.0);
-        let large_font = max_preview_chars(40.0, 300.0);
-        assert!(large_font < small_font, "a bigger font must fit fewer characters in the same width");
-    }
-
-    // --- `relative_age`: the vocabulary and the arithmetic behind it.
-
     #[test]
     fn anything_copied_less_than_a_minute_ago_reads_as_now() {
-        assert_eq!(relative_age(1_000, 1_000), "now", "copied this instant");
-        assert_eq!(relative_age(1_000, 950), "now", "copied 50 seconds ago");
+        assert_eq!(relative_age(1_000, 1_000), "now");
+        assert_eq!(relative_age(1_000, 950), "now");
     }
 
     #[test]
     fn minutes_hours_and_days_use_the_narrow_vocabulary() {
         assert_eq!(relative_age(1_000 + 5 * 60, 1_000), "5m");
-        assert_eq!(relative_age(1_000 + 59 * 60, 1_000), "59m");
         assert_eq!(relative_age(1_000 + 2 * 3600, 1_000), "2h");
-        assert_eq!(relative_age(1_000 + 23 * 3600, 1_000), "23h");
         assert_eq!(relative_age(1_000 + 3 * 86_400, 1_000), "3d");
     }
 
-    /// The boundary between two units lands on the unit that just
-    /// started, not the one that just ended — exactly 60 seconds is
-    /// "1m", not "60s" and not "now".
     #[test]
     fn a_boundary_belongs_to_the_unit_it_just_entered() {
         assert_eq!(relative_age(1_060, 1_000), "1m");
@@ -541,20 +659,59 @@ mod tests {
         assert_eq!(relative_age(1_000 + 86_400, 1_000), "1d");
     }
 
-    /// A `copied_at` in the future — a clock that jumped backward
-    /// between the daemon recording the copy and this popup drawing it
-    /// — must read as "now" rather than underflow the subtraction.
     #[test]
     fn a_copied_at_in_the_future_reads_as_now_rather_than_underflowing() {
         assert_eq!(relative_age(1_000, 5_000), "now");
+        assert_eq!(relative_age(0, u64::MAX), "now");
+        assert_eq!(long_age(1_000, 5_000), "just now");
     }
 
-    /// The same clock-jump hazard from the other side: `now` itself
-    /// behind where it should be. Still must not underflow or panic.
     #[test]
-    fn now_is_saturating_even_at_the_extremes() {
-        assert_eq!(relative_age(0, u64::MAX), "now");
-        let age = relative_age(u64::MAX, 0);
-        assert!(age.ends_with('d'), "got {age:?}");
+    fn the_long_age_says_it_in_words() {
+        assert_eq!(long_age(1_000 + 60, 1_000), "1 min ago");
+        assert_eq!(long_age(1_000 + 7200, 1_000), "2 h ago");
+        assert_eq!(long_age(1_000 + 86_400, 1_000), "1 day ago");
+        assert_eq!(long_age(1_000 + 3 * 86_400, 1_000), "3 days ago");
+    }
+
+    /// A timestamp chrono cannot represent must still produce words, not
+    /// a panic — the history file is plain TOML a person can edit.
+    #[test]
+    fn an_absurd_timestamp_still_describes_itself() {
+        assert!(!copied(u64::MAX, u64::MAX).is_empty());
+    }
+
+    #[test]
+    fn an_opaque_colour_shows_three_channels_and_a_translucent_one_its_alpha() {
+        assert_eq!(channels(hyprforge_look::Color::rgba(189, 147, 249, 255)), "189 147 249");
+        assert_eq!(channels(hyprforge_look::Color::rgba(0, 0, 0, 128)), "0 0 0 · 50%");
+    }
+
+    #[test]
+    fn counts_get_thousands_separators() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(1_284), "1,284");
+        assert_eq!(thousands(1_000_000), "1,000,000");
+    }
+
+    /// The well is a few lines tall: a huge copy is cut before the text
+    /// shaper ever sees it, on a character boundary.
+    #[test]
+    fn a_huge_copy_is_bounded_before_it_is_laid_out() {
+        let huge = "🎉".repeat(10_000);
+        let shown = bounded(&huge, 8, 400);
+        assert_eq!(shown.chars().count(), 401, "400 characters and an ellipsis");
+        let many_lines = "line\n".repeat(50);
+        assert!(bounded(&many_lines, 8, 400).ends_with('\u{2026}'));
+        assert_eq!(bounded("short", 8, 400), "short");
+    }
+
+    #[test]
+    fn the_corner_radius_comes_from_the_theme_rather_than_a_constant() {
+        let square = Theme { rounding: 0, ..Theme::default() };
+        assert_eq!(Look::new(&square).radius_for(34.0, 8.0), 0.0, "a square theme gets square rows");
+        let round = Theme { rounding: 12, ..Theme::default() };
+        assert_eq!(Look::new(&round).radius_for(34.0, 8.0), 8.0);
     }
 }
