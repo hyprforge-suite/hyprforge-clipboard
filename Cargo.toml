@@ -109,7 +109,7 @@ hyprforge-popup = { git = "https://github.com/adamrpostjr/hyprforge" }
 hyprforge-appearance = { git = "https://github.com/adamrpostjr/hyprforge" }
 hyprforge-look = { git = "https://github.com/adamrpostjr/hyprforge" }
 hyprforge-process = { git = "https://github.com/adamrpostjr/hyprforge" }
-iced_tiny_skia = { version = "0.14", default-features = false, features = ["image", "wayland"] }
+iced_tiny_skia = { version = "0.14.1", default-features = false, features = ["image", "wayland"] }
 iced_runtime = "0.14"
 iced_widget = { version = "0.14", features = ["image"] }
 iced_renderer = { version = "0.14", default-features = false, features = ["tiny-skia"] }
