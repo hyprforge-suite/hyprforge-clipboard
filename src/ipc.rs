@@ -590,6 +590,24 @@ pub fn set_pinned_at(path: &Path, id: &str, pinned: bool, timeout: Duration) -> 
     request_at(path, &request, timeout)
 }
 
+/// Asks `hyprforge-clipd` at the default socket path to forget `id` —
+/// the popup's Delete key. Like [`set_pinned`], this only ever *asks*:
+/// the daemon is the one writer of the history file, and a refusal (an
+/// id it no longer has, or a history it cannot save) comes back as
+/// [`ClientError::Refused`] rather than as a row that looks deleted and
+/// is not.
+pub fn remove_entry(id: &str) -> Result<(), ClientError> {
+    let path = socket_path().map_err(|_| ClientError::NoRuntimeDir)?;
+    remove_entry_at(&path, id, CLIENT_TIMEOUT)
+}
+
+/// [`remove_entry`] against an explicit socket `path` and `timeout` — the
+/// seam the tests below use to talk to a throwaway daemon instead of
+/// `$XDG_RUNTIME_DIR`'s real one.
+pub fn remove_entry_at(path: &Path, id: &str, timeout: Duration) -> Result<(), ClientError> {
+    request_at(path, &Request::Remove { id: id.to_string() }, timeout)
+}
+
 /// Asks `hyprforge-clipd` at the default socket path to put entry `id`
 /// back on the clipboard, with the daemon itself holding the selection
 /// open afterward — see this module's doc on why that is the whole
@@ -1142,6 +1160,38 @@ mod tests {
         {
             let history = shared.history.lock().await;
             assert!(history.entries()[0].pinned, "the daemon's own History was mutated");
+        }
+
+        server.abort();
+    }
+
+    /// The same round trip for the popup's Delete key: the client's
+    /// `remove` and the server's `Remove` agree on the wire, and the
+    /// entry is actually gone from the daemon's own history afterwards.
+    #[tokio::test]
+    async fn the_client_removes_an_entry_against_a_real_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clipd-remove-test.sock");
+        let (history, id) = history_with_one_entry();
+        let shared = test_shared(history, true);
+
+        let serve_path = path.clone();
+        let serve_shared = Arc::clone(&shared);
+        let server = tokio::spawn(async move {
+            let _ = run_at(&serve_path, serve_shared).await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let client_path = path.clone();
+        let client_id = id.as_str().to_string();
+        tokio::task::spawn_blocking(move || remove_entry_at(&client_path, &client_id, Duration::from_secs(2)))
+            .await
+            .unwrap()
+            .expect("remove must succeed against a running daemon");
+
+        {
+            let history = shared.history.lock().await;
+            assert!(history.entries().is_empty(), "the entry must be gone from the daemon's own History");
         }
 
         server.abort();
