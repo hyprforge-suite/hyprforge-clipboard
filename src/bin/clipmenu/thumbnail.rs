@@ -19,7 +19,7 @@
 //! under the 36-megapixel image that produced a 296MB decode. Decoded
 //! RGBA8 at the cap is 16,777,216 * 4 bytes = 64MB for one image; the
 //! popup only ever builds a handle for rows in the visible window (see
-//! `model::Model::set_window`), so the worst case is that window's worth of
+//! `model::Model::stack`'s visible lines), so the worst case is that window's worth of
 //! 64MB images, not the whole history's.
 
 use hyprforge_clipboard::{Content, Entry};
@@ -76,7 +76,7 @@ fn decode(bytes: &[u8]) -> Option<Handle> {
 ///
 /// Populated lazily, only for entries [`Cache::get`] is actually asked
 /// about — which the popup only calls for rows in the current visible
-/// window (see `model::Model::visible_range`). An entry that never
+/// window (see `model::Model::stack`). An entry that never
 /// scrolls into view is never decoded at all.
 #[derive(Default)]
 pub struct Cache {
