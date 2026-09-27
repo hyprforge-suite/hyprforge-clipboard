@@ -3,7 +3,7 @@ name = "hyprforge-clipboard"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "A Wayland clipboard library over wlr-data-control / ext-data-control, plus the hyprforge-clipd daemon that watches the compositor's clipboard and writes its history."
+description = "A Wayland clipboard library over wlr-data-control / ext-data-control, plus the hyprforge-clipd daemon that watches the compositor's clipboard and writes its history, and the hyprforge-clipmenu popup that shows it at the pointer and pastes what you pick."
 repository = "https://github.com/adamrpostjr/hyprforge"
 documentation = "https://docs.rs/hyprforge-clipboard"
 readme = "README.md"
@@ -13,9 +13,9 @@ categories = ["os::linux-apis", "gui"]
 # The library is read side, write side and paste synthesis over the
 # compositor's clipboard protocols — it knows nothing about a popup or a
 # history's own consumers. `hyprforge-clipd` below is the daemon that
-# owns writing the history file; the popup that reads it lives in its
-# own crate, the same "binary joins the library to a policy" split
-# `hyprforge-tray` uses for `hyprforge-trayd`.
+# owns writing the history file, the same "binary joins the library to
+# a policy" split `hyprforge-tray` uses for `hyprforge-trayd`; the popup
+# that reads it is the second binary below.
 [[bin]]
 name = "hyprforge-clipd"
 path = "src/bin/clipd.rs"

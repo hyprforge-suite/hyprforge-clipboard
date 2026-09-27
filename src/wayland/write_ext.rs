@@ -33,7 +33,7 @@
 //! `Waiter::wait`'s impl for it) so the *caller* can block, with a
 //! bound, until this thread reports [`SelectionOutcome::Served`] or
 //! [`SelectionOutcome::Superseded`] — see
-//! `crates/hyprforge-clipmenu/src/chooser.rs::Wired::choose`.
+//! `src/bin/clipmenu/chooser.rs`'s `Wired::finish_paste`.
 
 use crate::types::{Content, Mime};
 use crate::write::Offers;

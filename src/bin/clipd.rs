@@ -62,6 +62,7 @@
 //! | `{"cmd":"unpin","id":"<entry id>"}`     | `{"ok":true}`                 |
 //! | `{"cmd":"remove","id":"<entry id>"}`    | `{"ok":true}`                 |
 //! | `{"cmd":"set-clipboard","id":"<entry id>"}` | `{"ok":true}`             |
+//! | `{"cmd":"set-clipboard-text","text":"<s>"}` | `{"ok":true}`             |
 //! | `{"cmd":"list"}`                        | `{"ok":true,"entries":[…]}`   |
 //! | `{"cmd":"status"}`                      | `{"ok":true,"status":{…}}`    |
 //! | unknown / malformed                     | `{"ok":false,"error":"…"}`    |

@@ -40,7 +40,7 @@ use std::time::Duration;
 /// trait's**: a process that calls `set_selection` and then exits
 /// without waiting on the guard destroys the source out from under
 /// whoever tries to paste a moment later — see
-/// `crates/hyprforge-clipmenu/src/chooser.rs` for where that wait
+/// `src/bin/clipmenu/chooser.rs` for where that wait
 /// happens for the real popup.
 pub trait ClipboardWriter: Send + Sync {
     type Guard: SelectionGuard;

@@ -1,12 +1,14 @@
 # hyprforge-clipboard
 
-A Wayland clipboard history: the library, and `hyprforge-clipd`, the
-daemon that watches the compositor and records what is worth keeping.
+A Wayland clipboard history: the library, `hyprforge-clipd`, the
+daemon that watches the compositor and records what is worth keeping,
+and `hyprforge-clipmenu`, the popup that shows the history at the
+pointer and pastes what you pick.
 
 Part of [Hyprforge](https://github.com/adamrpostjr/hyprforge), a suite of
 native Hyprland desktop apps — but it runs alone. Installing this gets
-you a clipboard daemon and nothing else: no settings app, no tray, no
-Hyprland config machinery.
+you a clipboard daemon and its popup and nothing else: no settings app,
+no tray, no Hyprland config machinery.
 
 ## The rule it is built around
 
@@ -26,18 +28,22 @@ the same reason.
 - **The library** — the read side, the write side, and paste synthesis,
   over `wlr-data-control` and `ext-data-control`. It knows nothing about
   a popup or about any particular consumer of a history.
-- **`hyprforge-clipd`** — the daemon, and the only process that ever
-  writes the history file.
+- **`hyprforge-clipd`** (`src/bin/clipd.rs`) — the daemon, and the
+  only process that ever writes the history file.
+- **`hyprforge-clipmenu`** (`src/bin/clipmenu/`) — the popup a keybind
+  opens: search, filter tabs, pinned and recent entries, a preview, and
+  paste into whatever had focus. It is in this repository because a
+  binary cannot be fetched as a dependency the way a library can.
 
-There is deliberately no IPC: no socket, no D-Bus name, nothing a reader
-could ask the daemon to do. A popup reads the index and the image
-directory directly. Two writers racing on one index file is a problem
-that atomic writes cannot solve on their own — last write wins either
-way — so there is only ever one writer.
-
-The popup itself (`hyprforge-clipmenu`) lives in the main Hyprforge
-repository, because it draws with the suite's shared theme and that
-pulls in more than a standalone clipboard should need.
+The popup reads the index and the image directory directly, but it never
+writes them. Two writers racing on one index file is a problem that
+atomic writes cannot solve on their own — last write wins either way —
+so there is only ever one writer. A pin, a delete or a repeat paste is a
+*request* to the daemon over a Unix socket at
+`$XDG_RUNTIME_DIR/clipd.sock` (`src/ipc.rs` has the protocol); the
+daemon decides and saves. The daemon also holds the chosen entry on the
+clipboard, because on Wayland the selection dies with whoever set it and
+the popup exits the moment you pick.
 
 ## Building
 
@@ -45,8 +51,10 @@ pulls in more than a standalone clipboard should need.
 cargo build --release
 ```
 
-It depends on two other Hyprforge crates, `hyprforge-paths` and
-`hyprforge-secret`, taken as git dependencies on the main repository
+It depends on six other Hyprforge crates — `hyprforge-paths` and
+`hyprforge-secret` for the library, and `hyprforge-popup`,
+`hyprforge-appearance`, `hyprforge-look` and `hyprforge-process` for the
+popup — taken as git dependencies on the main repository
 rather than from crates.io, which is where they will move once they are
 published. Nothing else here is Hyprforge-specific.
 
