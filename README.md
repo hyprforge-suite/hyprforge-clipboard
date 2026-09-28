@@ -54,9 +54,8 @@ cargo build --release
 It depends on six other Hyprforge crates — `hyprforge-paths` and
 `hyprforge-secret` for the library, and `hyprforge-popup`,
 `hyprforge-appearance`, `hyprforge-look` and `hyprforge-process` for the
-popup — taken as git dependencies on the main repository
-rather than from crates.io, which is where they will move once they are
-published. Nothing else here is Hyprforge-specific.
+popup — published on crates.io,
+so cargo fetches them from there and never needs the main repository. Nothing else here is Hyprforge-specific.
 
 ## Running
 

@@ -61,11 +61,11 @@ xkbcommon = "0.8"
 # straight back to the local `crates/hyprforge-paths` and
 # `crates/hyprforge-secret` directories, so nothing here touches the
 # network; standalone, cargo fetches them from git.
-hyprforge-paths = { git = "https://github.com/hyprforge-suite/hyprforge" }
+hyprforge-paths = "0.1"
 # For the `chars`/`bytes` "redacted count" formatting `Content`'s `Debug`
 # shares with `hyprforge-network`'s `Psk` and `hyprforge-authui`'s typed
 # password — see `types.rs` for why `Content` is not itself a `Secret<T>`.
-hyprforge-secret = { git = "https://github.com/hyprforge-suite/hyprforge" }
+hyprforge-secret = "0.1"
 serde = { version = "1", features = ["derive"] }
 toml = "1.1"
 thiserror = "2"
@@ -105,10 +105,10 @@ serde_json = "1"
 # `web-colors`, which is why every surface in this suite is drawn by the
 # same renderer. `image` on both, for the thumbnails a copied picture
 # gets.
-hyprforge-popup = { git = "https://github.com/hyprforge-suite/hyprforge" }
-hyprforge-appearance = { git = "https://github.com/hyprforge-suite/hyprforge" }
-hyprforge-look = { git = "https://github.com/hyprforge-suite/hyprforge" }
-hyprforge-process = { git = "https://github.com/hyprforge-suite/hyprforge" }
+hyprforge-popup = "0.1"
+hyprforge-appearance = "0.1"
+hyprforge-look = "0.1"
+hyprforge-process = "0.1"
 iced_tiny_skia = { version = "0.14.1", default-features = false, features = ["image", "wayland"] }
 iced_runtime = "0.14"
 iced_widget = { version = "0.14", features = ["image"] }
