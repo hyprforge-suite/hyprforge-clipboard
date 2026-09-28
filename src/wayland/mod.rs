@@ -9,7 +9,7 @@
 //! `wl-paste --list-types` over data-control, which the `ext` module's
 //! doc comment records as the check that was actually run. A compositor
 //! that only ever shipped the older protocol still needs to work, so
-//! [`connect`] tries `ext` first and falls back to `wlr` rather than
+//! [`connect`](WaylandWatcher::connect) tries `ext` first and falls back to `wlr` rather than
 //! choosing one at compile time.
 //!
 //! `ext.rs` and `wlr.rs` are close to line-for-line copies of each

@@ -86,8 +86,8 @@ pub trait SelectionGuard: Send {
 }
 
 /// Shared between a source's background dispatch thread (which calls
-/// [`Self::signal`] once it knows the outcome) and the [`SelectionGuard`]
-/// handed back to the caller (which calls [`Self::wait`]). Pure
+/// `Self::signal` once it knows the outcome) and the [`SelectionGuard`]
+/// handed back to the caller (which calls [`wait`](SelectionGuard::wait)). Pure
 /// synchronization over a `Condvar` — no Wayland involved — which is
 /// exactly what makes it testable without a compositor; see the tests
 /// below.

@@ -6,14 +6,14 @@
 //! in parallel with this one, so it did not exist yet when this module
 //! was started. Rather than guess at that API up front, this crate
 //! defined its own small seam, [`Chooser`], and drove every test in this
-//! crate through [`mock::MockChooser`]. `hyprforge-clipboard`'s write
+//! crate through `mock::MockChooser`. `hyprforge-clipboard`'s write
 //! side landed before this was finished, so [`Wired`] below is the one
 //! place it plugs in — see its doc comment.
 use hyprforge_clipboard::{ClipboardWriter, Entry, Shortcut};
 use std::sync::Mutex;
 use std::time::Duration;
 
-/// How long [`Wired::choose`] waits, after synthesizing the paste, for
+/// How long [`Wired::finish_paste`](Chooser::finish_paste) waits, after synthesizing the paste, for
 /// the source it just created to be either read (a real paste
 /// happened) or superseded (someone else now owns the clipboard)
 /// before giving up and letting the process exit anyway.
@@ -91,8 +91,8 @@ pub trait Chooser {
 /// Failing to *set* the clipboard is the only thing that reports as
 /// `Err` here — that is the step a person cannot work around. A
 /// compositor with no virtual-keyboard protocol still gets the content
-/// onto the clipboard; [`PasteSynthesizer::paste`] reporting
-/// [`PasteOutcome::Unavailable`] is not a failure of *choosing*, only of
+/// onto the clipboard; [`PasteSynthesizer::paste`](hyprforge_clipboard::PasteSynthesizer::paste) reporting
+/// [`PasteOutcome::Unavailable`](hyprforge_clipboard::PasteOutcome::Unavailable) is not a failure of *choosing*, only of
 /// the one optional step after it, so it is reported to stderr and
 /// still returns `Ok`.
 pub struct Wired {

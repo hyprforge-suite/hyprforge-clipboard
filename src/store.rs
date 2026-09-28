@@ -126,7 +126,7 @@ impl History {
     ///
     /// Returns `false` for a copy this store will never hold: empty (or
     /// whitespace-only) content, or a single item over
-    /// [`MAX_SINGLE_ENTRY_BYTES`] — the two cases where there is nothing
+    /// `MAX_SINGLE_ENTRY_BYTES` — the two cases where there is nothing
     /// useful to add and, for the size case, admitting it would come at
     /// the cost of everything already kept (see the constant's doc).
     ///
@@ -160,7 +160,7 @@ impl History {
     }
 
     /// Pins or unpins an entry. A pinned entry is never evicted by
-    /// either cap in [`Self::enforce_caps`] — a pin is the user saying
+    /// either cap in `Self::enforce_caps` — a pin is the user saying
     /// "keep this", and a cap silently dropping it anyway would break
     /// that promise. Returns `false` if no entry has this id.
     pub fn set_pinned(&mut self, id: &EntryId, pinned: bool) -> bool {
@@ -196,7 +196,7 @@ impl History {
     }
 
     /// Total bytes across every kept entry — the same accounting
-    /// [`Self::enforce_caps`] uses against [`MAX_TOTAL_BYTES`]. Exposed
+    /// `Self::enforce_caps` uses against `MAX_TOTAL_BYTES`. Exposed
     /// for a `status` query so a caller can see how close the history is
     /// to that cap without duplicating the accounting itself.
     pub fn total_bytes(&self) -> u64 {
@@ -330,7 +330,7 @@ impl History {
     /// The orphan cleanup matters as much as the write does: without it,
     /// an entry evicted by a cap (or removed, or superseded) leaves its
     /// image file behind forever, which is exactly the unbounded disk
-    /// growth [`MAX_TOTAL_BYTES`] exists to prevent — the index would
+    /// growth `MAX_TOTAL_BYTES` exists to prevent — the index would
     /// stay small while the images directory kept growing regardless.
     pub fn save_to(&self, index_path: &Path, images_dir: &Path) -> Result<(), HistoryError> {
         std::fs::create_dir_all(images_dir).map_err(|source| HistoryError::Write {

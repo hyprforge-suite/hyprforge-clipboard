@@ -18,7 +18,7 @@
 //! daemon still is that one writer: [`History::save`] is called from
 //! exactly two places in this process — the watcher loop below, and the
 //! control socket's request handler in `ipc.rs` — and both hold the same
-//! `tokio::sync::Mutex<History>` (see [`ipc::Shared`]) while they touch
+//! `tokio::sync::Mutex<History>` (see [`ipc::Shared`](hyprforge_clipboard::ipc::Shared)) while they touch
 //! it, so a pin request and an incoming copy still cannot interleave
 //! into two half-applied writes. The popup gained a way to change
 //! history state; it did not gain a second path to the file. That request
@@ -37,7 +37,7 @@
 //! to be whatever was on the clipboard before. `ipc::Request::SetClipboard`
 //! is this daemon's answer: it looks the entry up in the history it
 //! already holds, calls [`hyprforge_clipboard::ClipboardWriter::set_selection`]
-//! itself, and keeps the returned guard in [`ipc::Shared::selection`] for
+//! itself, and keeps the returned guard in [`ipc::Shared::selection`](hyprforge_clipboard::ipc::Shared::selection) for
 //! as long as this process runs, replacing (and thereby dropping) the
 //! previous one on every new `set-clipboard`. What this buys: an entry,
 //! once chosen, stays pasteable — over and over, from any window — for

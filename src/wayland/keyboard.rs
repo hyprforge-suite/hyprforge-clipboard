@@ -275,7 +275,7 @@ impl Inner {
 /// Synthesizes Ctrl+V, or reports that it could not.
 ///
 /// Construction never fails: a compositor with no virtual-keyboard
-/// protocol (or no seat) yields a paster whose every [`Self::paste`]
+/// protocol (or no seat) yields a paster whose every [`paste`](crate::paste::PasteSynthesizer::paste)
 /// call reports [`PasteOutcome::Unavailable`] rather than an error
 /// bubbling out of `connect` — see the module doc.
 pub struct WaylandPaster {

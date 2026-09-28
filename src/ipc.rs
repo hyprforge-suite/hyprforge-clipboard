@@ -111,7 +111,7 @@
 //! # A client cannot tie up the daemon
 //!
 //! A connection that sends nothing at all is bounded by
-//! [`IDLE_TIMEOUT`] rather than left to `read_line` forever — the same
+//! `IDLE_TIMEOUT` rather than left to `read_line` forever — the same
 //! "nothing waits without a bound" rule as everywhere else in this
 //! workspace. Each connection also runs as its own task, so one slow or
 //! silent client cannot block another, or the clipboard watcher loop.
@@ -279,7 +279,7 @@ fn err(message: impl Into<String>) -> Response {
 /// the history lock before making the (unbounded) Wayland round trip
 /// `writer.set_selection` makes, and this function holds `history` for
 /// its whole body. This is still the entry point the tests use, with
-/// [`crate::write::mock::MockWriter`] standing in for a real writer —
+/// `crate::write::mock::MockWriter` (behind the `mock` feature) standing in for a real writer —
 /// the mock never blocks, so calling it from here is exactly as pure as
 /// every other request already is.
 pub fn handle_line<W: ClipboardWriter>(
@@ -570,7 +570,7 @@ fn request_at(path: &Path, request: &Request, timeout: Duration) -> Result<(), C
 }
 
 /// Asks `hyprforge-clipd` at the default socket path to pin or unpin
-/// `id`. See [`request_at`] for what actually happens on the wire, and
+/// `id`. See `request_at` for what actually happens on the wire, and
 /// this module's doc for why nothing here ever calls [`History::save`]
 /// itself — this only ever asks the daemon to.
 pub fn set_pinned(id: &str, pinned: bool) -> Result<(), ClientError> {
