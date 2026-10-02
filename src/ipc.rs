@@ -18,7 +18,7 @@
 //! # Protocol
 //!
 //! One JSON object per line, request → response, modelled directly on
-//! `notif-ipc` (`notif/crates/notif-ipc/src/lib.rs`) so this workspace
+//! `notif-ipc` (`crates/hyprforge-notif/crates/notif-ipc/src/lib.rs`) so this workspace
 //! has one socket convention rather than two:
 //!
 //! | Request                                    | Response                                   |
