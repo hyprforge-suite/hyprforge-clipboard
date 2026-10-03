@@ -23,7 +23,7 @@ path = "src/bin/clipd.rs"
 # The history popup, in this crate rather than beside it. It is a
 # separate *binary* — a keybind launches it — and a binary cannot be
 # fetched as a dependency the way a library can, so it has to be inside
-# the one directory `git subtree split` publishes or the clipboard's
+# this directory — the component's whole repository — or the clipboard's
 # repository ships a daemon with no way to see the history. It did, for
 # a while. See repo-plan.md, "The shape a package has to have".
 [[bin]]
@@ -53,14 +53,11 @@ wayland-protocols-misc = { version = "0.3", features = ["client"] }
 # (transitively, via the wayland stack); taken directly here because
 # nothing else in the workspace speaks to libxkbcommon yet.
 xkbcommon = "0.8"
-# Named as a git dependency, not a version, because the owner has not
-# published to crates.io yet: this manifest has to work unchanged both
-# inside the Hyprforge workspace and as the root of its own standalone
-# repository once `git subtree split` pulls it out. Inside the
-# workspace, the root Cargo.toml's `[patch]` section redirects this
-# straight back to the local `crates/hyprforge-paths` and
-# `crates/hyprforge-secret` directories, so nothing here touches the
-# network; standalone, cargo fetches them from git.
+# By crates.io version: this manifest has to work unchanged both inside
+# the Hyprforge workspace, where this directory is a submodule and the
+# root Cargo.toml's `[patch.crates-io]` section points these back at the
+# local `crates/` directories, and as the root of this component's own
+# repository, where cargo fetches the published crates.
 hyprforge-paths = "0.1"
 # For the `chars`/`bytes` "redacted count" formatting `Content`'s `Debug`
 # shares with `hyprforge-network`'s `Psk` and `hyprforge-authui`'s typed
