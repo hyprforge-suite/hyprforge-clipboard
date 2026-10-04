@@ -65,6 +65,11 @@ so cargo fetches them from there and never needs the main repository. Nothing el
 systemctl --user enable --now hyprforge-clipd
 ```
 
+That is the manual route. The Arch package enables it for every user
+when it is installed, through a systemd preset. With Hyprforge Settings
+installed, its **Set up** page (or `hyprforge-settings --setup`) enables
+the service and binds `hyprforge-clipmenu` to a key, and can undo both.
+
 `Restart=always` rather than `on-failure` is deliberate — a clean exit
 that stops recording is exactly as bad as a crash, and shows up as no
 failed unit at all.
