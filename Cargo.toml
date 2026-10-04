@@ -1,6 +1,6 @@
 [package]
 name = "hyprforge-clipboard"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 license = "MIT"
 description = "A Wayland clipboard library over wlr-data-control / ext-data-control, plus the hyprforge-clipd daemon that watches the compositor's clipboard and writes its history, and the hyprforge-clipmenu popup that shows it at the pointer and pastes what you pick."
