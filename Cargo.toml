@@ -25,7 +25,8 @@ path = "src/bin/clipd.rs"
 # fetched as a dependency the way a library can, so it has to be inside
 # this directory — the component's whole repository — or the clipboard's
 # repository ships a daemon with no way to see the history. It did, for
-# a while. See repo-plan.md, "The shape a package has to have".
+# a while. See the suite's docs/design/repo-plan.md,
+# "The shape a package has to have".
 [[bin]]
 name = "hyprforge-clipmenu"
 path = "src/bin/clipmenu/main.rs"
