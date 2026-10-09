@@ -10,6 +10,8 @@ native Hyprland desktop apps — but it runs alone. Installing this gets
 you a clipboard daemon and its popup and nothing else: no settings app,
 no tray, no Hyprland config machinery.
 
+![The clipboard history popup: pinned and recent entries tagged text, link, image and file, with the selected image previewed beside them](https://raw.githubusercontent.com/hyprforge-suite/hyprforge/main/docs/images/clipboard.png)
+
 ## The rule it is built around
 
 A clipboard manager writes a history to disk. A password manager puts
