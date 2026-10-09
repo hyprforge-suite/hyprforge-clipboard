@@ -548,6 +548,11 @@ where
         .align_y(Vertical::Center)
         .style(move |_: &iced_widget::Theme| container::Style {
             background: Some(look_copy.footer.into()),
+            // The bar runs along the popup's bottom edge, and the frame's
+            // clip is a rectangle, not its rounded shape: square corners here
+            // show as a faint square behind each of the popup's own. See
+            // `hyprforge_popup::kit::frame`.
+            border: Border { radius: iced_runtime::core::border::bottom(look_copy.radius), ..Default::default() },
             ..Default::default()
         })
         .into()
