@@ -132,7 +132,7 @@ impl Dispatch<ZwlrDataControlManagerV1, ()> for ProbeState {
 /// The claim every other part of this crate rests on: the compositor
 /// advertises *some* data-control manager at all.
 #[test]
-#[ignore]
+#[ignore = "live (the Wayland compositor's protocols): changes nothing"]
 fn a_data_control_manager_is_advertised() {
     let Some(connection) = connection_or_skip() else {
         return;
@@ -286,7 +286,7 @@ impl Dispatch<ExtDataControlOfferV1, ()> for SelectionState {
 /// `receive` request, so it never asks any source application to hand
 /// over what the user copied.
 #[test]
-#[ignore]
+#[ignore = "live (the Wayland compositor's protocols): changes nothing"]
 fn the_current_selections_mime_types_can_be_enumerated_without_reading_content() {
     let Some(connection) = connection_or_skip() else {
         return;
@@ -360,7 +360,7 @@ fn the_current_selections_mime_types_can_be_enumerated_without_reading_content()
 /// — so the test also requires the call to finish well inside its bound,
 /// which a read that had to wait for a late event would not.
 #[test]
-#[ignore]
+#[ignore = "live (the Wayland compositor's protocols): changes nothing"]
 fn a_one_shot_read_completes_without_reading_anything() {
     if connection_or_skip().is_none() {
         return;

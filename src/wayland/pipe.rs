@@ -248,7 +248,7 @@ mod tests {
     /// `Connection`, which tier 1 explicitly does not have. Run with
     /// `cargo test -p hyprforge-clipboard -- --ignored`.
     #[test]
-    #[ignore]
+    #[ignore = "live (the Wayland compositor's protocols): changes nothing"]
     fn a_source_that_writes_and_closes_is_read_back_in_full() {
         use std::io::Write;
         use std::os::fd::AsFd;
@@ -276,7 +276,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "live (the Wayland compositor's protocols): changes nothing"]
     fn a_source_that_never_writes_times_out_rather_than_hanging() {
         use std::os::fd::AsFd;
 
